@@ -85,37 +85,78 @@ def params_historical(instrument_name, days=7):
 
 @st.cache_data(ttl=60)
 def fetch_data(instruments_tuple):
+    """Fetch historical data for a tuple of instruments."""
     instr = list(instruments_tuple)
     if not instr: return pd.DataFrame()
     dfs = []
+    errors = 0
     for name in instr:
+        resp = None
         try:
-            resp = requests.get(URL_MARK_PRICE, params=params_historical(name), timeout=REQUEST_TIMEOUT); resp.raise_for_status()
-            marks = safe_get_in(["result", "mark"], resp.json(), default=[])
+            params_req = params_historical(name)
+            resp = requests.get(URL_MARK_PRICE, params=params_req, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            marks = safe_get_in(["result", "mark"], data, default=[])
             if marks:
-                df_temp = pd.DataFrame(marks, columns=COLUMNS); df_temp["instrument_name"] = name
-                if not df_temp.empty and "ts" in df_temp.columns and df_temp["ts"].notna().any(): dfs.append(df_temp)
-        except Exception: pass
+                df_temp = pd.DataFrame(marks, columns=COLUMNS)
+                df_temp["instrument_name"] = name
+                if not df_temp.empty and "ts" in df_temp.columns and df_temp["ts"].notna().any():
+                    dfs.append(df_temp)
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Network/HTTP error fetching data for {name}: {e}")
+            errors += 1
+        except Exception as e:
+            logging.error(f"Error processing data for {name}: {e}", exc_info=True)
+            errors += 1
         time.sleep(0.1)
+
+    if errors > 0:
+        st.warning(f"Encountered errors fetching data for {errors}/{len(instr)} instruments. Check logs.")
+
     if not dfs: return pd.DataFrame()
     try:
         dfc = pd.concat(dfs).reset_index(drop=True)
         dfc['date_time'] = pd.to_datetime(dfc['ts'], unit='s', errors='coerce').dt.tz_localize('UTC')
-        def safe_get_strike(s): try: return int(s.split('-')[2]); except: return np.nan
-        def safe_get_type(s): try: return s.split('-')[-1]; except: return None
+        dfc = dfc.dropna(subset=['date_time'])
+
+        def safe_get_strike(s):
+            try:
+                return int(s.split('-')[2])
+            except:  # Corrected indentation
+                return np.nan
+
+        def safe_get_type(s):
+            try:
+                return s.split('-')[-1]
+            except:  # Corrected indentation
+                return None
+
         dfc['k'] = dfc['instrument_name'].apply(safe_get_strike)
         dfc['option_type'] = dfc['instrument_name'].apply(safe_get_type)
+
         def get_expiry_datetime_from_name(instr_name_str):
             try:
                 if not isinstance(instr_name_str, str): return pd.NaT
-                parts = instr_name_str.split('-');
-                if len(parts) >= 2: return dt.datetime.strptime(parts[1], "%d%b%y").replace(tzinfo=dt.timezone.utc, hour=8)
-            except Exception: return pd.NaT
+                parts = instr_name_str.split('-')
+                if len(parts) >= 2:
+                    return dt.datetime.strptime(parts[1], "%d%b%y").replace(tzinfo=dt.timezone.utc, hour=8, minute=0, second=0)
+            except Exception:
+                pass
+            return pd.NaT
+
         dfc['expiry_datetime_col'] = dfc['instrument_name'].apply(get_expiry_datetime_from_name)
-        essential_cols = ['date_time','k', 'option_type', 'mark_price_close', 'iv_close', 'expiry_datetime_col']
+        essential_cols = ['date_time', 'k', 'option_type', 'mark_price_close', 'iv_close', 'expiry_datetime_col']
         dfc = dfc.dropna(subset=essential_cols)
-        return dfc.sort_values("date_time") if not dfc.empty else pd.DataFrame()
-    except Exception: return pd.DataFrame()
+
+        if dfc.empty:
+            logging.warning("DataFrame empty after essential column NaN drop in fetch_data.")
+            return pd.DataFrame()
+        return dfc.sort_values("date_time")
+    except Exception as e:
+        st.error(f"Error during final processing in fetch_data: {e}")
+        logging.error(f"Final processing error in fetch_data: {e}", exc_info=True)
+        return pd.DataFrame()
 
 def fetch_kraken_data(coin="BTC", days=7): # Spot data needed for historical greeks
     try:
