@@ -815,7 +815,130 @@ def calculate_and_display_autocorrelation(daily_log_returns, windows=[7, 15, 30]
                 except Exception: regime_symbol = "!"
             st.markdown(f"<p style='text-align: center; font-size: small; color: grey; margin-bottom: -10px;'>{window}-Day</p>", unsafe_allow_html=True)
             st.markdown(f"<h1 style='text-align: center; margin-bottom: -10px;'>{regime_symbol}</h1>", unsafe_allow_html=True)
-            st.markdown(f"<p style='text-align: center; font-size: small; margin-top: 0px;'>{regime_map.get(regime_symbol, 'Unknown')}</p>", unsafe_allow_html=True)        
+            st.markdown(f"<p style='text-align: center; font-size: small; margin-top: 0px;'>{regime_map.get(regime_symbol, 'Unknown')}</p>", unsafe_allow_html=True)
+def display_mm_gamma_adjustment_analysis(dft_latest_snap, spot_price, snapshot_time_utc, risk_free_rate=0.0):
+    """
+    Displays an indicative Delta-Gamma hedge adjustment for an assumed Market Maker (MM) book.
+    Assumes MM is short all options in dft_latest_snap for the selected expiry.
+    Selects a near-ATM call from the same expiry as the gamma hedging instrument.
+    """
+    st.subheader("MM Indicative Delta-Gamma Hedge Adjustment (Selected Expiry)")
+    st.caption("Assumes Market Maker is short the entire displayed option book for this expiry. "
+               "Shows theoretical adjustment using a near-ATM call from the same expiry to hedge gamma.")
+
+    log_prefix = "MM_DG_Adjust:"
+
+    # --- 1. Input Validation ---
+    required_cols = ['instrument_name', 'k', 'option_type', 'iv_close', 'open_interest', 'expiry_datetime_col'] # Added expiry_datetime_col
+    if dft_latest_snap.empty or not all(c in dft_latest_snap.columns for c in required_cols):
+        st.warning(f"{log_prefix} Cannot perform analysis: Latest snapshot data missing required columns or empty.")
+        logging.warning(f"{log_prefix} dft_latest_snap empty or missing columns.")
+        return
+    if pd.isna(spot_price) or spot_price <= 0:
+        st.warning(f"{log_prefix} Invalid spot price: {spot_price}.")
+        return
+
+    df_book = dft_latest_snap.copy()
+    df_book['open_interest'] = pd.to_numeric(df_book['open_interest'], errors='coerce').fillna(0)
+    df_book = df_book[df_book['open_interest'] > 0] # Consider only options with OI
+
+    if df_book.empty:
+        st.info(f"{log_prefix} No options with open interest in the latest snapshot for this expiry.")
+        return
+
+    # --- 2. MM Book Greeks (Pre-Hedge) ---
+    # Assuming MM is SHORT the book, so multiply greeks by -1 * open_interest
+    st.write("Calculating MM Book Greeks (assuming MM is short the book)...") # For user feedback
+    df_book['mm_delta_pos'] = -1 * df_book.apply(
+        lambda r: compute_delta(r, spot_price, snapshot_time_utc, risk_free_rate), axis=1
+    ) * df_book['open_interest']
+
+    df_book['mm_gamma_pos'] = -1 * df_book.apply(
+        lambda r: compute_gamma(r, spot_price, snapshot_time_utc, risk_free_rate), axis=1
+    ) * df_book['open_interest']
+
+    mm_net_delta_initial = df_book['mm_delta_pos'].sum(skipna=True)
+    mm_net_gamma_initial = df_book['mm_gamma_pos'].sum(skipna=True)
+
+    if pd.isna(mm_net_delta_initial) or pd.isna(mm_net_gamma_initial):
+        st.error(f"{log_prefix} Failed to calculate initial MM book greeks. Check option data.")
+        return
+
+    st.metric("MM Initial Net Delta (Book)", f"{mm_net_delta_initial:,.2f}")
+    st.metric("MM Initial Net Gamma (Book)", f"{mm_net_gamma_initial:,.4f}")
+
+    # --- 3. Select Gamma Hedging Instrument (Near-ATM Call from same expiry) ---
+    gamma_hedger_selected = None
+    all_calls_in_book = df_book[df_book['option_type'] == 'C'].copy()
+    if not all_calls_in_book.empty:
+        all_calls_in_book['moneyness_dist'] = abs(all_calls_in_book['k'] - spot_price)
+        # Prefer slightly OTM or ATM calls for gamma hedging
+        atm_ish_calls = all_calls_in_book[all_calls_in_book['k'] >= spot_price].sort_values('moneyness_dist')
+        if not atm_ish_calls.empty:
+            gamma_hedger_selected_name = atm_ish_calls['instrument_name'].iloc[0]
+        else: # Fallback to closest ITM call if no ATM/OTM
+            atm_ish_calls = all_calls_in_book.sort_values('moneyness_dist')
+            if not atm_ish_calls.empty:
+                gamma_hedger_selected_name = atm_ish_calls['instrument_name'].iloc[0]
+            else: gamma_hedger_selected_name = None
+        
+        if gamma_hedger_selected_name:
+            # Get the full row for the selected hedger from the original df_book to ensure all columns are present
+            gamma_hedger_selected_row_data = df_book[df_book['instrument_name'] == gamma_hedger_selected_name].iloc[[0]]
+            if not gamma_hedger_selected_row_data.empty:
+                 gamma_hedger_selected = gamma_hedger_selected_row_data.iloc[0].copy() # as a Series
+    
+    if gamma_hedger_selected is None:
+        st.warning(f"{log_prefix} Could not select a suitable Call option from the book for gamma hedging.")
+        return
+
+    hedger_details_name = gamma_hedger_selected['instrument_name']
+    st.info(f"Selected Gamma Hedging Instrument: {hedger_details_name}")
+
+    # Calculate Greeks for ONE unit of the hedging instrument
+    D_h = compute_delta(gamma_hedger_selected, spot_price, snapshot_time_utc, risk_free_rate)
+    G_h = compute_gamma(gamma_hedger_selected, spot_price, snapshot_time_utc, risk_free_rate)
+
+    if pd.isna(D_h) or pd.isna(G_h) or abs(G_h) < 1e-7: # Gamma of hedger must be significant
+        st.error(f"{log_prefix} Invalid greeks for selected gamma hedging instrument ({hedger_details_name}): Delta={D_h}, Gamma={G_h}")
+        return
+
+    # --- 4. Calculate Gamma Hedge Quantity (N_h) ---
+    N_h = -mm_net_gamma_initial / G_h
+
+    # --- 5. Calculate Delta Impact of Gamma Hedge ---
+    delta_from_gamma_hedge = N_h * D_h
+
+    # --- 6. Calculate New Net Delta (Post-Gamma Hedge) ---
+    mm_net_delta_post_gamma_hedge = mm_net_delta_initial + delta_from_gamma_hedge
+
+    # --- 7. Calculate Final Underlying Hedge ---
+    underlying_hedge_qty = -mm_net_delta_post_gamma_hedge
+
+    # --- 8. Display Results ---
+    st.markdown("#### Indicative Gamma Hedge Adjustment:")
+    cols_gamma_hedge = st.columns(3)
+    with cols_gamma_hedge[0]:
+        st.metric("Gamma Hedger Delta (Dₕ)", f"{D_h:.4f}")
+    with cols_gamma_hedge[1]:
+        st.metric("Gamma Hedger Gamma (Gₕ)", f"{G_h:.6f}")
+    with cols_gamma_hedge[2]:
+        action_gh = "Buy" if N_h > 0 else "Sell" if N_h < 0 else "Hold"
+        st.metric(f"Hedge Option Qty ({action_gh})", f"{abs(N_h):,.2f} units")
+    
+    st.metric("Delta Change from Gamma Hedge", f"{delta_from_gamma_hedge:,.2f}")
+    
+    st.markdown("---")
+    st.markdown("#### Indicative Final Delta Hedge (Post-Gamma Adj.):")
+    st.metric("MM Net Delta (After Gamma Hedge)", f"{mm_net_delta_post_gamma_hedge:,.2f}")
+    
+    action_underlying = "Buy" if underlying_hedge_qty > 0 else "Sell" if underlying_hedge_qty < 0 else "Hold"
+    st.metric(f"Final Underlying Hedge ({action_underlying} Spot/Perp)", f"{abs(underlying_hedge_qty):,.2f} {st.session_state.selected_coin}")
+
+    final_net_delta_book = mm_net_delta_post_gamma_hedge + underlying_hedge_qty
+    st.success(f"**Resulting Book Net Delta (Post-All Adjustments):** {final_net_delta_book:,.4f} (should be ~0)")
+    st.caption("This indicates the spot/perp hedge needed for the MM to become delta-neutral *after* also neutralizing gamma with the chosen option.")
+    logging.info(f"{log_prefix} Displayed MM gamma adjustment analysis.")            
 def plot_combined_premium_difference(df_atm_results, df_itm_results, expiry_label): # df_agg_oi_results removed as it's not used
     st.subheader(f"Options Premium Bias Comparison (Expiry: {expiry_label})")
     valid_atm = isinstance(df_atm_results, pd.DataFrame) and not df_atm_results.empty and 'atm_difference' in df_atm_results.columns and 'date_time' in df_atm_results.columns
