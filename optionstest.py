@@ -1527,10 +1527,7 @@ def main():
     with col_mm3: st.metric("MM Net Vega", f"{net_vega_mm:,.0f}" if pd.notna(net_vega_mm) else "N/A")
     with col_mm4: st.metric("MM Net Vanna", f"{net_vanna_mm:,.0f}" if pd.notna(net_vanna_mm) else "N/A")
     with col_mm5: st.metric("MM Net Charm", f"{net_charm_mm:,.2f}" if pd.notna(net_charm_mm) else "N/A")
-    if not dft.empty and not df_krak_5m.empty and selected_expiry:
-        safe_plot(plot_delta_oi_heatmap_refined, dft, df_krak_5m, selected_expiry)
-        safe_plot(plot_gex_heatmap, dft, df_krak_5m, selected_expiry)
-        safe_plot(plot_net_delta_flow_heatmap, dft, df_krak_5m, selected_expiry, coin)
+
 # =========================== MM Indicative Delta-Gamma Hedge (Snapshot Analysis) ==========================
     st.markdown("---")
     st.header("MM Indicative Delta-Gamma Hedge Adjustment (Latest Snapshot)")
