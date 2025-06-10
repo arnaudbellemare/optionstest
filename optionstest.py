@@ -1345,59 +1345,8 @@ def main():
             else: st.warning("Could not find a suitable Call option in latest snapshot for MM D-G Sim.")
 
 
-    # =========================== ITM Gamma Exposure Analysis ==========================
-    st.markdown("---"); st.header(f"ITM Gamma Exposure Analysis (Expiry: {selected_expiry.strftime('%d%b%y') if selected_expiry else 'N/A'})")
-    if not dft.empty and not df_krak_5m.empty and pd.notna(spot_price) and selected_expiry:
-        safe_plot(compute_and_plot_itm_gex_ratio, dft=dft, df_krak_5m=df_krak_5m, spot_price_latest=spot_price, selected_expiry_obj=selected_expiry)
 
-    # =========================== Delta Hedging Simulations ==========================
-    st.markdown("---"); st.header("Delta Hedging Simulations (Full Expiry Book)")
-    show_delta_hedging_sims_main = st.sidebar.checkbox("Show Full Book Delta Hedge Sims", value=True, key="show_delta_hedging_main_plot_v3") # Changed Key
-    if show_delta_hedging_sims_main:
-        st.sidebar.markdown("##### Full Book Delta Hedge Params")
-        use_dynamic_threshold_main = st.sidebar.checkbox("Dynamic Threshold?", value=False, key="use_dyn_thresh_main_plot_v3")
-        use_dynamic_hedge_size_main = st.sidebar.checkbox("Dynamic Hedge Size?", value=False, key="use_dyn_size_main_plot_v3")
-        base_thresh_main = st.sidebar.slider("Base Δ Threshold", 0.01, 0.5, 0.20, 0.01, key='base_thresh_slider_main_plot_v3', format="%.2f")
-        min_hedge_rat_main = st.sidebar.slider("Min Hedge Ratio (%)", 0, 100, 50, 5, key='min_hedge_ratio_slider_main_plot_v3', format="%d%%", disabled=not use_dynamic_hedge_size_main) / 100.0
-        max_hedge_rat_main = st.sidebar.slider("Max Hedge Ratio (%)", 0, 100, 100, 5, key='max_hedge_ratio_slider_main_plot_v3', format="%d%%", disabled=not use_dynamic_hedge_size_main) / 100.0
-        if not dft.empty and not df_krak_5m.empty:
-            try:
-                hedge_instance_main = HedgeThalex(df_historical=dft, spot_df=df_krak_5m, symbol=coin, base_threshold=base_thresh_main, use_dynamic_threshold=use_dynamic_threshold_main, use_dynamic_hedge_size=use_dynamic_hedge_size_main, min_hedge_ratio=min_hedge_rat_main, max_hedge_ratio=max_hedge_rat_main)
-                with st.spinner("Running Traditional Delta Hedge Sim..."): delta_df_main, hedge_df_main = hedge_instance_main.run_loop(days=5)
-                if not delta_df_main.empty: safe_plot(plot_delta_hedging_thalex, delta_df_main, hedge_df_main, base_thresh_main, use_dynamic_threshold_main, coin, spot_price, df_krak_5m)
-            except Exception as e: st.error(f"Trad. Hedging Sim Error (Main): {e}")
-        if not dft.empty and not df_krak_5m.empty:
-            try:
-                matrix_hedge_instance_main = MatrixHedgeThalex(df_historical=dft, spot_df=df_krak_5m, symbol=coin)
-                with st.spinner("Running Matrix Delta Hedge Sim..."): matrix_portfolio_state_df_main, matrix_hedge_actions_df_main = matrix_hedge_instance_main.run_loop(days=5)
-                if not matrix_portfolio_state_df_main.empty: safe_plot(plot_matrix_hedge_thalex, matrix_portfolio_state_df_main, matrix_hedge_actions_df_main, coin)
-            except Exception as e: st.error(f"Matrix Hedging Sim Error (Main): {e}")
 
-    # =========================== Options Premium Bias Comparison ==========================
-    st.markdown("---"); st.header(f"Options Premium Bias Comparison (Expiry: {selected_expiry.strftime('%d%b%y')})")
-    df_atm_results_bias = calculate_atm_premium_data(dft, df_krak_5m, selected_expiry)
-    df_itm_results_bias = calculate_itm_premium_data(dft, df_krak_5m, selected_expiry)
-    safe_plot(plot_combined_premium_difference, df_atm_results_bias, df_itm_results_bias, selected_expiry.strftime('%d%b%y'))
-
-    # =========================== Delta Neutral Pair Analysis ==========================
-    st.markdown("---"); st.header("Delta Neutral Pair Analysis (Ideal Pair)")
-    st.sidebar.markdown("---"); st.sidebar.subheader("Ideal Pair Delta Hedge Sim")
-    find_ideal_pair_button = st.sidebar.button("Find Ideal Pair for Sim", key="find_ideal_pair_btn_deltafocus_v3")
-    selected_call_instr_ideal = None; selected_put_instr_ideal = None
-    if find_ideal_pair_button and not dft_latest.empty:
-        with st.spinner("Finding ideal OTM pair..."):
-            if 'delta' in dft_latest.columns:
-                calls_latest_ideal = dft_latest[dft_latest['option_type'] == 'C'].copy(); puts_latest_ideal = dft_latest[dft_latest['option_type'] == 'P'].copy()
-                target_call_delta = 0.25; target_put_delta = -0.25
-                if not calls_latest_ideal.empty: calls_latest_ideal['delta_diff'] = abs(calls_latest_ideal['delta'] - target_call_delta); selected_call_instr_ideal = calls_latest_ideal.loc[calls_latest_ideal['delta_diff'].idxmin(), 'instrument_name'] if not calls_latest_ideal['delta_diff'].empty else None
-                if not puts_latest_ideal.empty: puts_latest_ideal['delta_diff'] = abs(puts_latest_ideal['delta'] - target_put_delta); selected_put_instr_ideal = puts_latest_ideal.loc[puts_latest_ideal['delta_diff'].idxmin(), 'instrument_name'] if not puts_latest_ideal['delta_diff'].empty else None
-                if selected_call_instr_ideal and selected_put_instr_ideal: st.sidebar.success(f"Ideal Pair Found.")
-    if not selected_call_instr_ideal and all_calls_expiry: selected_call_instr_ideal = all_calls_expiry[0]
-    if not selected_put_instr_ideal and all_puts_expiry: selected_put_instr_ideal = all_puts_expiry[0]
-    if selected_call_instr_ideal and selected_put_instr_ideal:
-        st.caption(f"Using Pair for Delta Neutral Sim: Call: {selected_call_instr_ideal} | Put: {selected_put_instr_ideal}")
-        safe_plot(plot_net_delta_otm_pair, dft=dft, df_spot_hist=df_krak_5m, exchange_instance=exchange1, selected_call_instr=selected_call_instr_ideal, selected_put_instr=selected_put_instr_ideal)
-    else: st.warning("Could not determine a call/put pair for Delta Neutral Pair Analysis.")
 
     gc.collect()
     logging.info(f"Focused Dashboard rendering complete for {coin} {e_str if e_str else ''}.")
