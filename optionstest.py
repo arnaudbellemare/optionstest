@@ -169,7 +169,40 @@ def fetch_kraken_data(coin="BTC", days=7): # Spot data needed for historical gre
         dfr = dfr.dropna(subset=['date_time']).sort_values("date_time")
         return dfr[dfr["date_time"] >= start_dt].reset_index(drop=True)
     except Exception: return pd.DataFrame()
+def fetch_kraken_data_daily(days=365, coin="BTC"):
+    """Fetch daily OHLCV data from Kraken. Returns UTC-aware DataFrame."""
+    logging.info(f"Fetching {days} days of daily Kraken data for {coin}/USD.")
+    try:
+        k = ccxt.kraken()
+        now_dt = dt.datetime.now(dt.timezone.utc) # Ensure UTC
+        start_dt = now_dt - dt.timedelta(days=days)
+        since = int(start_dt.timestamp() * 1000)
+        symbol = f"{coin}/USD"
+        ohlcv = k.fetch_ohlcv(symbol, timeframe="1d", since=since)
+        if not ohlcv:
+            st.warning(f"No daily OHLCV data returned from Kraken for {symbol}.")
+            return pd.DataFrame()
 
+        dfr = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        dfr["date_time"] = pd.to_datetime(dfr["timestamp"], unit="ms", errors='coerce').dt.tz_localize("UTC")
+        dfr = dfr.dropna(subset=['date_time'])
+        dfr.sort_values("date_time", inplace=True)
+        dfr.reset_index(drop=True, inplace=True)
+        logging.info(f"Kraken daily data fetched. Shape: {dfr.shape}")
+        return dfr
+
+    except ccxt.NetworkError as e:
+        st.error(f"Kraken Network Error fetching daily data: {e}")
+        logging.error(f"Kraken Network Error fetching daily data: {e}")
+        return pd.DataFrame()
+    except ccxt.ExchangeError as e:
+        st.error(f"Kraken Exchange Error fetching daily data: {e}")
+        logging.error(f"Kraken Exchange Error fetching daily data: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Unexpected error fetching Kraken daily data: {e}")
+        logging.error(f"Unexpected error fetching Kraken daily data: {e}", exc_info=True)
+        return pd.DataFrame()
 def get_valid_expiration_options(current_date_utc):
     instruments = fetch_instruments()
     if not instruments: return []
