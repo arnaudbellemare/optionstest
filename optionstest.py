@@ -1012,14 +1012,44 @@ class MatrixDeltaGammaHedgeSimple:
         return options_at_ts['value_pos'].sum(skipna=True), options_at_ts['delta_pos'].sum(skipna=True), options_at_ts['gamma_pos'].sum(skipna=True)
 
     def _get_gamma_hedger_greeks_and_price(self, timestamp, spot_price):
-        if not self.gamma_hedge_instrument_details: return np.nan, np.nan, np.nan
+        if not self.gamma_hedge_instrument_details:
+            return np.nan, np.nan, np.nan
+
         details = self.gamma_hedge_instrument_details
-        hedger_row = pd.Series({'instrument_name': details['name'], 'k': details['k'], 'option_type': details['option_type'], 'expiry_datetime_col': details['expiry_datetime_col'], 'iv_close': details['iv_close_source'](timestamp, spot_price) if callable(details['iv_close_source']) else details['iv_close_source']})
-        if pd.isna(hedger_row['iv_close']) or hedger_row['iv_close'] <= 0: return np.nan, np.nan, np.nan
-        hedger_delta = compute_delta(hedger_row, spot_price, timestamp, self.risk_free_rate); hedger_gamma = compute_gamma(hedger_row, spot_price, timestamp, self.risk_free_rate)
-        hedger_price = details['mark_price_close_source'](timestamp, spot_price) if 'mark_price_close_source' in details and callable(details['mark_price_close_source']) else details.get('mark_price_close_source', np.nan)
-        if pd.isna(hedger_delta) or pd.isna(hedger_gamma) or abs(hedger_gamma) < 1e-7: return np.nan, np.nan, hedger_price
-        return hedger_delta, hedger_gamma, hedger_price
+        hedger_name = details['name'] # Expect 'name' to be the instrument_name
+
+        # Find the hedger's data in the main portfolio DataFrame at the current timestamp
+        # self.df_portfolio_options should be pre-filtered for relevant expiries if necessary,
+        # or contain all options data passed to the class.
+        hedger_data_at_ts = self.df_portfolio_options[
+            (self.df_portfolio_options['instrument_name'] == hedger_name) &
+            (self.df_portfolio_options['date_time'] == timestamp)
+        ]
+
+        if hedger_data_at_ts.empty:
+            logging.warning(f"Hedger {hedger_name} data not found at timestamp {timestamp}")
+            return np.nan, np.nan, np.nan
+
+        hedger_row_series = hedger_data_at_ts.iloc[0].copy() # Ensure it's a Series
+
+        current_hedger_iv = hedger_row_series.get('iv_close', np.nan)
+        current_hedger_mark_price = hedger_row_series.get('mark_price_close', np.nan)
+
+        if pd.isna(current_hedger_iv) or current_hedger_iv <= 0:
+            logging.warning(f"Hedger {hedger_name} IV invalid at {timestamp}: {current_hedger_iv}")
+            # Return NaNs for greeks, but price might still be valid if IV is the only issue
+            return np.nan, np.nan, current_hedger_mark_price
+
+        # Pass the full row (which includes k, option_type, expiry_datetime_col, iv_close)
+        hedger_delta = compute_delta(hedger_row_series, spot_price, timestamp, self.risk_free_rate)
+        hedger_gamma = compute_gamma(hedger_row_series, spot_price, timestamp, self.risk_free_rate)
+        
+        MIN_GAMMA_FOR_GREEK_VALIDITY = 1e-7 # A small threshold to consider gamma valid
+        if pd.isna(hedger_delta) or pd.isna(hedger_gamma) or abs(hedger_gamma) < MIN_GAMMA_FOR_GREEK_VALIDITY:
+            logging.warning(f"Hedger {hedger_name} greeks invalid or gamma too small at {timestamp}. D={hedger_delta}, G={hedger_gamma}")
+            return np.nan, np.nan, current_hedger_mark_price
+
+        return hedger_delta, hedger_gamma, current_hedger_mark_price
 
     def _solve_delta_gamma_hedge_system(self, portfolio_value, portfolio_delta, portfolio_gamma, spot_price, hedger_delta, hedger_gamma, hedger_price):
         if pd.isna(portfolio_delta) or pd.isna(portfolio_gamma) or pd.isna(spot_price) or pd.isna(hedger_delta) or pd.isna(hedger_gamma): return np.nan, np.nan, np.nan
@@ -1035,49 +1065,118 @@ class MatrixDeltaGammaHedgeSimple:
             except np.linalg.LinAlgError: return np.nan, np.nan, np.nan
 
     def run_loop(self, days=5):
-        if self.df_portfolio_options.empty or self.spot_df.empty: return pd.DataFrame(), pd.DataFrame()
-        latest_hist_ts = self.df_portfolio_options['date_time'].max(); latest_spot_ts = self.spot_df['date_time'].max()
-        if pd.isna(latest_hist_ts) or pd.isna(latest_spot_ts): return pd.DataFrame(), pd.DataFrame()
-        latest_timestamp = min(latest_hist_ts, latest_spot_ts); min_data_ts = max(self.df_portfolio_options['date_time'].min(), self.spot_df['date_time'].min())
-        if pd.isna(min_data_ts): return pd.DataFrame(), pd.DataFrame()
-        potential_start_timestamp = latest_timestamp - pd.Timedelta(days=days); start_timestamp = max(potential_start_timestamp, min_data_ts)
-        if start_timestamp >= latest_timestamp : return pd.DataFrame(), pd.DataFrame()
-        sim_options_df = self.df_portfolio_options[(self.df_portfolio_options['date_time'] >= start_timestamp) & (self.df_portfolio_options['date_time'] <= latest_timestamp)].copy()
-        sim_spot_df = self.spot_df[(self.spot_df['date_time'] >= start_timestamp) & (self.spot_df['date_time'] <= latest_timestamp)].copy()
-        if sim_options_df.empty or sim_spot_df.empty: return pd.DataFrame(), pd.DataFrame()
-        loop_driving_timestamps = sorted(sim_options_df['date_time'].unique())
-        if not loop_driving_timestamps: return pd.DataFrame(), pd.DataFrame()
-        loop_timestamps_df = pd.DataFrame({'date_time': loop_driving_timestamps})
-        spot_for_sim = pd.merge_asof(left=loop_timestamps_df.sort_values('date_time'), right=sim_spot_df[['date_time', 'close']].sort_values('date_time'), on='date_time', direction='backward', tolerance=pd.Timedelta('10min'))
-        spot_for_sim['close'] = spot_for_sim['close'].ffill().bfill(); spot_for_sim = spot_for_sim.dropna(subset=['date_time', 'close'])
-        if spot_for_sim.empty: return pd.DataFrame(), pd.DataFrame()
-        final_sim_timestamps = sorted(spot_for_sim['date_time'].unique())
+        # ... (initial setup code for sim_options_df, sim_spot_df, spot_for_sim, final_sim_timestamps remains the same) ...
         if not final_sim_timestamps: return pd.DataFrame(), pd.DataFrame()
-        self.portfolio_state_log = []; self.hedge_actions_log = []; self.current_underlying_hedge_qty = 0.0; self.current_gamma_option_hedge_qty = 0.0; trade_tolerance = 1e-6
+
+        self.portfolio_state_log = []
+        self.hedge_actions_log = []
+        self.current_underlying_hedge_qty = 0.0
+        self.current_gamma_option_hedge_qty = 0.0
+        trade_tolerance = 1e-6 # Minimum trade size to register
+        MIN_EFFECTIVE_HEDGER_GAMMA = 1e-5  # More stringent threshold for usability
+
         for ts in final_sim_timestamps:
             try:
                 spot_price_at_ts = spot_for_sim.loc[spot_for_sim['date_time'] == ts, 'close'].iloc[0]
-                if pd.isna(spot_price_at_ts) or spot_price_at_ts <= 0: continue
-                port_val, port_delta, port_gamma = self._get_portfolio_greeks(ts, spot_price_at_ts)
-                if pd.isna(port_delta) or pd.isna(port_gamma): continue
-                hedger_D, hedger_G, hedger_P = np.nan, np.nan, np.nan
-                if self.gamma_hedge_instrument_details:
-                    hedger_D, hedger_G, hedger_P = self._get_gamma_hedger_greeks_and_price(ts, spot_price_at_ts)
-                    if pd.isna(hedger_D) or pd.isna(hedger_G): hedger_D, hedger_G, hedger_P = 0.0, 1e-9, 0.0
-                else: hedger_D, hedger_G, hedger_P = 0.0, 1e-9, 0.0
-                target_B, target_n_underlying, target_n_gamma_opt = self._solve_delta_gamma_hedge_system(port_val, port_delta, port_gamma, spot_price_at_ts, hedger_D, hedger_G, hedger_P)
-                if pd.notna(target_n_underlying):
-                    trade_size_underlying = target_n_underlying - self.current_underlying_hedge_qty
-                    if abs(trade_size_underlying) > trade_tolerance: self.hedge_actions_log.append({'timestamp': ts, 'instrument': self.symbol + '-PERP', 'action': 'buy' if trade_size_underlying > 0 else 'sell', 'size': abs(trade_size_underlying), 'price': spot_price_at_ts, 'type': 'delta_underlying'}); self.current_underlying_hedge_qty = target_n_underlying
-                if self.gamma_hedge_instrument_details and pd.notna(target_n_gamma_opt):
-                    trade_size_gamma_opt = target_n_gamma_opt - self.current_gamma_option_hedge_qty
-                    if abs(trade_size_gamma_opt) > trade_tolerance: self.hedge_actions_log.append({'timestamp': ts, 'instrument': self.gamma_hedge_instrument_details['name'], 'action': 'buy' if trade_size_gamma_opt > 0 else 'sell', 'size': abs(trade_size_gamma_opt), 'price': hedger_P if pd.notna(hedger_P) else np.nan, 'type': 'gamma_option'}); self.current_gamma_option_hedge_qty = target_n_gamma_opt
-                net_delta_final = port_delta + self.current_underlying_hedge_qty * 1.0 + (self.current_gamma_option_hedge_qty * hedger_D if pd.notna(hedger_D) else 0)
-                net_gamma_final = port_gamma + (self.current_gamma_option_hedge_qty * hedger_G if pd.notna(hedger_G) else 0)
-                self.portfolio_state_log.append({'timestamp': ts, 'spot_price': spot_price_at_ts, 'portfolio_value': port_val, 'portfolio_delta': port_delta, 'portfolio_gamma': port_gamma, 'target_B': target_B, 'target_n_underlying': target_n_underlying, 'target_n_gamma_opt': target_n_gamma_opt, 'current_n_underlying': self.current_underlying_hedge_qty, 'current_n_gamma_opt': self.current_gamma_option_hedge_qty, 'hedger_delta_at_ts': hedger_D, 'hedger_gamma_at_ts': hedger_G, 'hedger_price_at_ts': hedger_P, 'net_delta_final': net_delta_final, 'net_gamma_final': net_gamma_final})
-            except Exception: self.portfolio_state_log.append({'timestamp': ts, 'spot_price': np.nan, 'portfolio_value':np.nan, 'portfolio_delta':np.nan, 'portfolio_gamma':np.nan, 'target_B':np.nan, 'target_n_underlying':np.nan, 'target_n_gamma_opt':np.nan, 'current_n_underlying':self.current_underlying_hedge_qty, 'current_n_gamma_opt':self.current_gamma_option_hedge_qty, 'hedger_delta_at_ts':np.nan, 'hedger_gamma_at_ts':np.nan, 'hedger_price_at_ts':np.nan, 'net_delta_final':np.nan, 'net_gamma_final':np.nan})
-        return pd.DataFrame(self.portfolio_state_log), pd.DataFrame(self.hedge_actions_log)
+                if pd.isna(spot_price_at_ts) or spot_price_at_ts <= 0:
+                    logging.warning(f"Invalid spot price at {ts}: {spot_price_at_ts}. Skipping step.")
+                    continue
 
+                port_val, port_delta, port_gamma = self._get_portfolio_greeks(ts, spot_price_at_ts)
+                if pd.isna(port_delta) or pd.isna(port_gamma):
+                    logging.warning(f"Portfolio greeks NaN at {ts}. Delta={port_delta}, Gamma={port_gamma}. Skipping step.")
+                    continue
+
+                hedger_D_current, hedger_G_current, hedger_P_current = np.nan, np.nan, np.nan
+                can_gamma_hedge_this_step = False
+
+                if self.gamma_hedge_instrument_details:
+                    hedger_D_temp, hedger_G_temp, hedger_P_temp = self._get_gamma_hedger_greeks_and_price(ts, spot_price_at_ts)
+                    if pd.notna(hedger_G_temp) and abs(hedger_G_temp) >= MIN_EFFECTIVE_HEDGER_GAMMA and pd.notna(hedger_D_temp):
+                        hedger_D_current, hedger_G_current, hedger_P_current = hedger_D_temp, hedger_G_temp, hedger_P_temp
+                        can_gamma_hedge_this_step = True
+                    else:
+                        logging.warning(f"Timestamp {ts}: Gamma hedger unsuitable. G={hedger_G_temp}. Gamma hedge option trade will not be made this step.")
+                
+                # Step 1: Calculate and apply gamma option hedge if feasible
+                actual_trade_size_gamma_opt = 0.0
+                if can_gamma_hedge_this_step:
+                    target_total_gamma_opt_qty = -port_gamma / hedger_G_current
+                    trade_size_gamma_opt_ideal = target_total_gamma_opt_qty - self.current_gamma_option_hedge_qty
+                    
+                    if abs(trade_size_gamma_opt_ideal) > trade_tolerance:
+                        actual_trade_size_gamma_opt = trade_size_gamma_opt_ideal
+                        self.hedge_actions_log.append({
+                            'timestamp': ts, 'instrument': self.gamma_hedge_instrument_details['name'],
+                            'action': 'buy' if actual_trade_size_gamma_opt > 0 else 'sell',
+                            'size': abs(actual_trade_size_gamma_opt),
+                            'price': hedger_P_current if pd.notna(hedger_P_current) else np.nan,
+                            'type': 'gamma_option'
+                        })
+                        self.current_gamma_option_hedge_qty += actual_trade_size_gamma_opt
+                
+                # Step 2: Calculate delta to hedge (portfolio delta + delta from total gamma option position)
+                delta_to_be_hedged_by_underlying = port_delta
+                if self.gamma_hedge_instrument_details and pd.notna(hedger_D_current): # Use current step's delta for the gamma option type
+                    delta_to_be_hedged_by_underlying += self.current_gamma_option_hedge_qty * hedger_D_current
+                elif self.current_gamma_option_hedge_qty != 0:
+                    # If hedger_D_current is NaN, but we have gamma options, their delta contribution is uncertain.
+                    # This implies the hedger instrument itself became problematic.
+                    # For simplicity, we proceed, but this could be refined (e.g. use last known good delta).
+                    logging.warning(f"Timestamp {ts}: Delta of gamma option ({self.current_gamma_option_hedge_qty} units) is uncertain as hedger_D_current is NaN.")
+
+
+                # Step 3: Calculate and apply underlying hedge
+                target_total_underlying_qty = -delta_to_be_hedged_by_underlying
+                trade_size_underlying = target_total_underlying_qty - self.current_underlying_hedge_qty
+                
+                if abs(trade_size_underlying) > trade_tolerance:
+                    self.hedge_actions_log.append({
+                        'timestamp': ts, 'instrument': self.symbol + '-PERP',
+                        'action': 'buy' if trade_size_underlying > 0 else 'sell',
+                        'size': abs(trade_size_underlying),
+                        'price': spot_price_at_ts,
+                        'type': 'delta_underlying'
+                    })
+                    self.current_underlying_hedge_qty += trade_size_underlying
+
+                # Log portfolio state *after* hedges for this timestamp
+                net_delta_final = port_delta + self.current_underlying_hedge_qty # Delta from underlying
+                net_gamma_final = port_gamma
+                if self.gamma_hedge_instrument_details and pd.notna(hedger_D_current) and pd.notna(hedger_G_current):
+                    net_delta_final += self.current_gamma_option_hedge_qty * hedger_D_current
+                    net_gamma_final += self.current_gamma_option_hedge_qty * hedger_G_current
+                
+                self.portfolio_state_log.append({
+                    'timestamp': ts, 'spot_price': spot_price_at_ts,
+                    'portfolio_value': port_val,
+                    'portfolio_delta': port_delta, 'portfolio_gamma': port_gamma,
+                    'target_B': np.nan, # Not directly calculated in stepwise
+                    'target_n_underlying': self.current_underlying_hedge_qty, # Log current total position
+                    'target_n_gamma_opt': self.current_gamma_option_hedge_qty, # Log current total position
+                    'current_n_underlying': self.current_underlying_hedge_qty,
+                    'current_n_gamma_opt': self.current_gamma_option_hedge_qty,
+                    'hedger_delta_at_ts': hedger_D_current if can_gamma_hedge_this_step else np.nan,
+                    'hedger_gamma_at_ts': hedger_G_current if can_gamma_hedge_this_step else np.nan,
+                    'hedger_price_at_ts': hedger_P_current if can_gamma_hedge_this_step else np.nan,
+                    'net_delta_final': net_delta_final,
+                    'net_gamma_final': net_gamma_final
+                })
+
+            except Exception as e:
+                logging.error(f"Error in simulation loop at timestamp {ts}: {e}", exc_info=True)
+                # Append a NaN state to keep timeseries alignment if needed, or handle error
+                self.portfolio_state_log.append({
+                    'timestamp': ts, 'spot_price': np.nan, 'portfolio_value':np.nan,
+                    'portfolio_delta':np.nan, 'portfolio_gamma':np.nan, 'target_B':np.nan,
+                    'target_n_underlying':self.current_underlying_hedge_qty, # Log last known good state
+                    'target_n_gamma_opt':self.current_gamma_option_hedge_qty, # Log last known good state
+                    'current_n_underlying':self.current_underlying_hedge_qty,
+                    'current_n_gamma_opt':self.current_gamma_option_hedge_qty,
+                    'hedger_delta_at_ts':np.nan, 'hedger_gamma_at_ts':np.nan,
+                    'hedger_price_at_ts':np.nan, 'net_delta_final':np.nan, 'net_gamma_final':np.nan
+                })
+        return pd.DataFrame(self.portfolio_state_log), pd.DataFrame(self.hedge_actions_log)
 def plot_mm_delta_gamma_hedge(portfolio_state_df, hedge_actions_df, symbol):
     st.subheader(f"MM Delta-Gamma Hedging Simulation Visuals ({symbol})")
     if portfolio_state_df.empty: return
@@ -1329,11 +1428,14 @@ def main():
 
             if not gamma_hedger_candidate_df.empty:
                 gamma_hedger_row_sim = gamma_hedger_candidate_df.iloc[0]
+# In main() function, when preparing gamma_hedger_details_sim:
                 gamma_hedger_details_sim = {
-                    'name': gamma_hedger_row_sim['instrument_name'], 'k': gamma_hedger_row_sim['k'], 'option_type': 'C',
-                    'expiry_datetime_col': gamma_hedger_row_sim['expiry_datetime_col'],
-                    'iv_close_source': gamma_hedger_row_sim['iv_close'],
-                    'mark_price_close_source': gamma_hedger_row_sim['mark_price_close']
+                    'name': gamma_hedger_row_sim['instrument_name'],
+                    # Other details like k, option_type, expiry can be stored for reference
+                    # but are primarily looked up via the instrument_name from df_portfolio_options
+                    'k': gamma_hedger_row_sim['k'],
+                    'option_type': gamma_hedger_row_sim['option_type'],
+                    'expiry_datetime_col': gamma_hedger_row_sim['expiry_datetime_col']
                 }
                 try:
                     mm_dg_sim_instance = MatrixDeltaGammaHedgeSimple(df_portfolio_options=dft, spot_df=df_krak_5m, symbol=coin, risk_free_rate=risk_free_rate, gamma_hedge_instrument_details=gamma_hedger_details_sim)
