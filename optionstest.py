@@ -676,7 +676,104 @@ def calculate_itm_premium_data(dft, df_krak_5m, selected_expiry_obj):
             itm_premiums.append({'date_time': ts, 'itm_call_premium': call_price_itm, 'itm_put_premium': put_price_itm, 'itm_difference': difference}) # No need for strikes/spot here
         return pd.DataFrame(itm_premiums)
     except Exception: return pd.DataFrame()
+def calculate_hurst_lo_modified(series, min_n=10, max_n=None, q_method='auto'): # q_method kept for signature consistency if needed elsewhere
+    """
+    Calculates the Hurst exponent using Lo's (1991) modified R/S analysis,
+    which is more robust to short-term dependence.
+    NOTE: For this focused version, the q-adjustment for autocovariance is simplified
+    and effectively defaults to classic R/S if calculate_lo_modified_variance isn't fully implemented.
+    """
+    if isinstance(series, list): series = np.array(series)
+    elif isinstance(series, pd.Series): series = series.values
 
+    series = series[~np.isnan(series)]; N = len(series)
+
+    if max_n is None: max_n = N // 2
+    max_n = min(max_n, N - 1); min_n = max(2, min_n) # n must be at least 2 and < N
+
+    if N < 20 or min_n >= max_n : # Need at least a few points and valid range
+        logging.warning(f"Series too short (N={N}) or invalid n range ({min_n}-{max_n}) for Hurst (Lo) calculation.")
+        return np.nan, pd.DataFrame()
+
+    # Generate intervals (logarithmic spacing is generally preferred)
+    ns = np.unique(np.geomspace(min_n, max_n, num=20, dtype=int))
+    ns = [n_val for n_val in ns if n_val >= min_n] # Ensure min_n is respected
+
+    if not ns:
+         logging.warning("No valid window sizes 'n' found for Hurst (Lo).")
+         return np.nan, pd.DataFrame()
+
+    rs_values = []; valid_ns = []
+
+    for n_interval in ns: # Renamed n to n_interval to avoid conflict if Lo's n is used later
+        # Determine q for this n_interval (simplified for this version)
+        q = 0 # Effectively classic R/S if calculate_lo_modified_variance is simplified
+        if isinstance(q_method, int): q = max(0, min(q_method, n_interval - 1))
+        elif q_method == 'auto' and n_interval > 10 : q = max(0, min(int(np.floor(1.1447 * (n_interval**(1/3)))), n_interval - 1))
+
+        rs_chunk_list = [] # Renamed rs_chunk to rs_chunk_list
+        num_chunks = N // n_interval
+        if num_chunks < 1: continue
+
+        for i in range(num_chunks):
+            chunk = series[i * n_interval : (i + 1) * n_interval]
+            if len(chunk) < 2: continue # Need at least 2 points for std dev
+
+            mean = np.mean(chunk)
+            if pd.isna(mean): continue # Skip if mean cannot be calculated (e.g., all NaNs)
+
+            if np.allclose(chunk, mean): continue # Skip constant chunks (R=0, S=0)
+
+            mean_adjusted = chunk - mean
+            cum_dev = np.cumsum(mean_adjusted)
+            if cum_dev.size == 0: continue # Should not happen if chunk had len >=2 and not constant
+
+            # R calculation: max of cum_dev - min of cum_dev (including initial zero)
+            cum_dev_with_zero = np.insert(cum_dev, 0, 0.0)
+            R = np.ptp(cum_dev_with_zero) # Peak-to-peak is max - min
+
+            if pd.isna(R) or R < 0: continue # Range must be non-negative
+
+            # S calculation (Standard Deviation)
+            # For Lo's R/S_q, S_q is the square root of the modified variance.
+            # Here, we'll use standard deviation for classic R/S as a fallback/simplification.
+            # The full calculate_lo_modified_variance is needed for true Lo's R/S_q.
+            # S = np.std(chunk, ddof=0) # Population standard deviation as per original R/S
+            # If calculate_lo_modified_variance IS NOT defined or used:
+            S = np.std(chunk, ddof=0) # Use ddof=0 for population std dev as in classic R/S
+
+            if pd.isna(S) or S <= 1e-9: continue # S must be positive
+
+            rs_ratio = R / S
+            if not pd.isna(rs_ratio) and rs_ratio >= 0: # R/S must be non-negative
+                rs_chunk_list.append(rs_ratio)
+
+        if rs_chunk_list: # If we got valid R/S values for this interval size
+            rs_values.append(np.mean(rs_chunk_list))
+            valid_ns.append(n_interval)
+    
+    if len(valid_ns) < 3: # Need at least 3 points for a reliable regression
+        logging.warning(f"Insufficient valid R/S points ({len(valid_ns)}) for Hurst regression.")
+        return np.nan, pd.DataFrame()
+
+    results_df = pd.DataFrame({'interval': valid_ns, 'rs_mean': rs_values})
+    results_df = results_df.replace([np.inf, -np.inf], np.nan).dropna() # Clean up final results
+    if len(results_df) < 3:
+        logging.warning(f"Insufficient valid R/S points ({len(results_df)}) after final dropna for Hurst regression.")
+        return np.nan, pd.DataFrame()
+
+    log_intervals = np.log(results_df['interval'])
+    log_rs = np.log(results_df['rs_mean']) # Ensure rs_mean is positive here
+
+    try:
+        hurst, _, _, _, _ = linregress(log_intervals, log_rs) # Using scipy.stats.linregress
+        return hurst, results_df
+    except (np.linalg.LinAlgError, ValueError) as e:
+        logging.error(f"Error during Hurst (Lo) polyfit: {e}")
+        return np.nan, results_df
+    except Exception as e:
+        logging.error(f"Unexpected error during Hurst (Lo) polyfit: {e}")
+        return np.nan, results_df
 def plot_combined_premium_difference(df_atm_results, df_itm_results, expiry_label): # df_agg_oi_results removed as it's not used
     st.subheader(f"Options Premium Bias Comparison (Expiry: {expiry_label})")
     valid_atm = isinstance(df_atm_results, pd.DataFrame) and not df_atm_results.empty and 'atm_difference' in df_atm_results.columns and 'date_time' in df_atm_results.columns
