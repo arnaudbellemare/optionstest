@@ -1064,105 +1064,237 @@ class MatrixDeltaGammaHedgeSimple:
             try: x = np.linalg.solve(A, b); return x[0], x[1], x[2]
             except np.linalg.LinAlgError: return np.nan, np.nan, np.nan
 
-def run_loop(self, days=5):
-        # ... (initial setup code for sim_options_df, sim_spot_df, spot_for_sim up to the dropna) ...
-        # Ensure this initial setup code (before the part below) correctly defines sim_options_df and sim_spot_df
-        # and that spot_for_sim is correctly created and cleaned.
+    def run_loop(self, days=5):
+        try: # Top-level try for the whole method
+            # --- 1. Initial Data Validation and Range Setup ---
+            if self.df_portfolio_options.empty or self.spot_df.empty:
+                logging.info("MatrixDeltaGammaHedgeSimple.run_loop: df_portfolio_options or spot_df is empty at start. Exiting.")
+                return pd.DataFrame(), pd.DataFrame()
 
-        if self.df_portfolio_options.empty or self.spot_df.empty:
-            logging.info("MatrixDeltaGammaHedgeSimple.run_loop: df_portfolio_options or spot_df is empty at start. Exiting.")
-            return pd.DataFrame(), pd.DataFrame()
+            latest_hist_ts = self.df_portfolio_options['date_time'].max()
+            latest_spot_ts = self.spot_df['date_time'].max()
+            if pd.isna(latest_hist_ts) or pd.isna(latest_spot_ts):
+                logging.info(f"MatrixDeltaGammaHedgeSimple.run_loop: latest_hist_ts ({latest_hist_ts}) or latest_spot_ts ({latest_spot_ts}) is NaN. Exiting.")
+                return pd.DataFrame(), pd.DataFrame()
 
-        latest_hist_ts = self.df_portfolio_options['date_time'].max()
-        latest_spot_ts = self.spot_df['date_time'].max()
-        if pd.isna(latest_hist_ts) or pd.isna(latest_spot_ts):
-            logging.info("MatrixDeltaGammaHedgeSimple.run_loop: latest_hist_ts or latest_spot_ts is NaN. Exiting.")
-            return pd.DataFrame(), pd.DataFrame()
+            latest_timestamp = min(latest_hist_ts, latest_spot_ts)
+            
+            # Ensure min_data_ts is valid before using in max()
+            min_portfolio_ts = self.df_portfolio_options['date_time'].min()
+            min_spot_ts = self.spot_df['date_time'].min()
+            if pd.isna(min_portfolio_ts) or pd.isna(min_spot_ts):
+                logging.info(f"MatrixDeltaGammaHedgeSimple.run_loop: min_portfolio_ts ({min_portfolio_ts}) or min_spot_ts ({min_spot_ts}) is NaN. Exiting.")
+                return pd.DataFrame(), pd.DataFrame()
+            min_data_ts = max(min_portfolio_ts, min_spot_ts)
 
-        latest_timestamp = min(latest_hist_ts, latest_spot_ts)
-        min_data_ts = max(self.df_portfolio_options['date_time'].min(), self.spot_df['date_time'].min())
-        if pd.isna(min_data_ts):
-            logging.info("MatrixDeltaGammaHedgeSimple.run_loop: min_data_ts is NaN. Exiting.")
-            return pd.DataFrame(), pd.DataFrame()
 
-        potential_start_timestamp = latest_timestamp - pd.Timedelta(days=days)
-        start_timestamp = max(potential_start_timestamp, min_data_ts)
+            potential_start_timestamp = latest_timestamp - pd.Timedelta(days=days)
+            start_timestamp = max(potential_start_timestamp, min_data_ts)
 
-        if start_timestamp >= latest_timestamp:
-            logging.info(f"MatrixDeltaGammaHedgeSimple.run_loop: start_timestamp ({start_timestamp}) >= latest_timestamp ({latest_timestamp}). No sim range. Exiting.")
-            return pd.DataFrame(), pd.DataFrame()
+            if start_timestamp >= latest_timestamp:
+                logging.info(f"MatrixDeltaGammaHedgeSimple.run_loop: start_timestamp ({start_timestamp}) >= latest_timestamp ({latest_timestamp}). No sim range. Exiting.")
+                return pd.DataFrame(), pd.DataFrame()
 
-        sim_options_df = self.df_portfolio_options[
-            (self.df_portfolio_options['date_time'] >= start_timestamp) &
-            (self.df_portfolio_options['date_time'] <= latest_timestamp)
-        ].copy()
-        sim_spot_df = self.spot_df[
-            (self.spot_df['date_time'] >= start_timestamp) &
-            (self.spot_df['date_time'] <= latest_timestamp)
-        ].copy()
+            logging.info(f"MatrixDeltaGammaHedgeSimple.run_loop: Simulation period from {start_timestamp} to {latest_timestamp}.")
 
-        if sim_options_df.empty or sim_spot_df.empty:
-            logging.info("MatrixDeltaGammaHedgeSimple.run_loop: sim_options_df or sim_spot_df is empty after filtering for sim range. Exiting.")
-            return pd.DataFrame(), pd.DataFrame()
+            # --- 2. Filter Data for Simulation Period ---
+            sim_options_df = self.df_portfolio_options[
+                (self.df_portfolio_options['date_time'] >= start_timestamp) &
+                (self.df_portfolio_options['date_time'] <= latest_timestamp)
+            ].copy()
+            sim_spot_df = self.spot_df[
+                (self.spot_df['date_time'] >= start_timestamp) &
+                (self.spot_df['date_time'] <= latest_timestamp)
+            ].copy()
 
-        loop_driving_timestamps = sorted(sim_options_df['date_time'].unique())
-        if not loop_driving_timestamps:
-            logging.info("MatrixDeltaGammaHedgeSimple.run_loop: No unique timestamps in sim_options_df. Exiting.")
-            return pd.DataFrame(), pd.DataFrame()
+            if sim_options_df.empty or sim_spot_df.empty:
+                logging.info(f"MatrixDeltaGammaHedgeSimple.run_loop: sim_options_df (empty: {sim_options_df.empty}) or sim_spot_df (empty: {sim_spot_df.empty}) is empty after filtering for sim range. Exiting.")
+                return pd.DataFrame(), pd.DataFrame()
 
-        loop_timestamps_df = pd.DataFrame({'date_time': loop_driving_timestamps})
-        spot_for_sim = pd.merge_asof(
-            left=loop_timestamps_df.sort_values('date_time'),
-            right=sim_spot_df[['date_time', 'close']].sort_values('date_time'),
-            on='date_time',
-            direction='backward',
-            tolerance=pd.Timedelta('10min') # Consider if tolerance needs adjustment
-        )
-        spot_for_sim['close'] = spot_for_sim['close'].ffill().bfill()
-        spot_for_sim = spot_for_sim.dropna(subset=['date_time', 'close'])
+            # --- 3. Determine Driving Timestamps for Simulation ---
+            # Use unique timestamps from the options data as the primary loop driver
+            loop_driving_timestamps_array = sim_options_df['date_time'].unique()
+            if len(loop_driving_timestamps_array) == 0:
+                 logging.info("MatrixDeltaGammaHedgeSimple.run_loop: No unique timestamps in sim_options_df. Exiting.")
+                 return pd.DataFrame(), pd.DataFrame()
+            loop_driving_timestamps = sorted(loop_driving_timestamps_array)
 
-        if spot_for_sim.empty:
-            logging.info("MatrixDeltaGammaHedgeSimple.run_loop: spot_for_sim is empty after merge and dropna. Exiting.")
-            return pd.DataFrame(), pd.DataFrame()
 
-        # ---- Robust creation of final_sim_timestamps ----
-        unique_dates_array = None
-        final_sim_timestamps_defined = False # Flag to track definition
+            loop_timestamps_df = pd.DataFrame({'date_time': loop_driving_timestamps})
 
-        try:
-            if 'date_time' not in spot_for_sim.columns:
-                logging.error("MatrixDeltaGammaHedgeSimple.run_loop: 'date_time' column missing in spot_for_sim. Exiting.")
+            # Merge spot data onto these driving timestamps
+            spot_for_sim = pd.merge_asof(
+                left=loop_timestamps_df.sort_values('date_time'), # Ensure left is sorted
+                right=sim_spot_df[['date_time', 'close']].sort_values('date_time'), # Ensure right is sorted
+                on='date_time',
+                direction='backward', # Use last known spot if exact match not found
+                tolerance=pd.Timedelta('10min') # Allow some gap
+            )
+            # Forward fill then backward fill to handle NaNs from merge_asof or initial NaNs in spot data
+            spot_for_sim['close'] = spot_for_sim['close'].ffill().bfill()
+            spot_for_sim = spot_for_sim.dropna(subset=['date_time', 'close']) # Remove rows where spot is still NaN
+
+            if spot_for_sim.empty:
+                logging.info("MatrixDeltaGammaHedgeSimple.run_loop: spot_for_sim is empty after merge_asof and NaN handling. Exiting.")
+                return pd.DataFrame(), pd.DataFrame()
+
+            # --- 4. Refine Final Simulation Timestamps ---
+            # Ensure final_sim_timestamps are only those where we have valid spot data
+            final_sim_timestamps_defined = False
+            final_sim_timestamps = []
+            try:
+                if 'date_time' not in spot_for_sim.columns:
+                    logging.error("MatrixDeltaGammaHedgeSimple.run_loop: 'date_time' column missing in spot_for_sim. Exiting.")
+                    return pd.DataFrame(), pd.DataFrame()
+                
+                unique_dates_array_final = spot_for_sim['date_time'].unique()
+                if len(unique_dates_array_final) > 0:
+                    final_sim_timestamps = sorted(unique_dates_array_final)
+                    final_sim_timestamps_defined = True
+                logging.debug(f"MatrixDeltaGammaHedgeSimple.run_loop: Final unique timestamps for sim: {len(final_sim_timestamps)}")
+
+            except Exception as e_final_ts:
+                logging.error(f"MatrixDeltaGammaHedgeSimple.run_loop: Error processing final sim timestamps: {e_final_ts}", exc_info=True)
+                return pd.DataFrame(), pd.DataFrame()
+
+            if not final_sim_timestamps_defined or not final_sim_timestamps:
+                logging.info("MatrixDeltaGammaHedgeSimple.run_loop: No valid final simulation timestamps after processing spot_for_sim. Exiting.")
                 return pd.DataFrame(), pd.DataFrame()
             
-            unique_dates_array = spot_for_sim['date_time'].unique()
-            logging.debug(f"MatrixDeltaGammaHedgeSimple.run_loop: Successfully got unique_dates_array. Length: {len(unique_dates_array)}")
+            logging.info(f"MatrixDeltaGammaHedgeSimple.run_loop: Proceeding with {len(final_sim_timestamps)} simulation timestamps.")
 
-        except Exception as e_unique:
-            logging.error(f"MatrixDeltaGammaHedgeSimple.run_loop: Error calling .unique() on spot_for_sim['date_time']: {e_unique}", exc_info=True)
-            return pd.DataFrame(), pd.DataFrame() # Exit if .unique() fails
+            # --- 5. Initialize Hedging State and Logs ---
+            self.portfolio_state_log = []
+            self.hedge_actions_log = []
+            self.current_underlying_hedge_qty = 0.0
+            self.current_gamma_option_hedge_qty = 0.0
+            trade_tolerance = 1e-6  # Minimum trade size to register
+            MIN_EFFECTIVE_HEDGER_GAMMA = 1e-5 # Minimum gamma for hedger to be considered effective
 
-        try:
-            final_sim_timestamps = sorted(unique_dates_array)
-            final_sim_timestamps_defined = True # Set flag only if sorted() succeeds
-            logging.debug(f"MatrixDeltaGammaHedgeSimple.run_loop: Successfully sorted unique_dates_array. Length of final_sim_timestamps: {len(final_sim_timestamps)}")
+            # --- 6. Main Simulation Loop ---
+            for ts in final_sim_timestamps:
+                try:
+                    # Get spot price for the current timestamp
+                    spot_price_at_ts_series = spot_for_sim.loc[spot_for_sim['date_time'] == ts, 'close']
+                    if spot_price_at_ts_series.empty:
+                        logging.warning(f"Timestamp {ts}: Spot price not found in spot_for_sim. Skipping step.")
+                        continue # Should not happen if final_sim_timestamps is derived from spot_for_sim
+                    spot_price_at_ts = spot_price_at_ts_series.iloc[0]
+                    
+                    if pd.isna(spot_price_at_ts) or spot_price_at_ts <= 0:
+                        logging.warning(f"Timestamp {ts}: Invalid spot price ({spot_price_at_ts}). Skipping step.")
+                        continue
 
-        except Exception as e_sorted:
-            logging.error(f"MatrixDeltaGammaHedgeSimple.run_loop: Error calling sorted() on unique_dates_array: {e_sorted}", exc_info=True)
-            # Do not proceed if sorting fails, final_sim_timestamps will not be correctly defined
-            return pd.DataFrame(), pd.DataFrame()
+                    # Get portfolio greeks at current timestamp and spot
+                    port_val, port_delta, port_gamma = self._get_portfolio_greeks(ts, spot_price_at_ts)
+                    if pd.isna(port_delta) or pd.isna(port_gamma):
+                        logging.warning(f"Timestamp {ts}: Portfolio greeks NaN (Delta={port_delta}, Gamma={port_gamma}). Skipping step.")
+                        # Log a NaN state for this timestamp to maintain series
+                        self.portfolio_state_log.append({'timestamp': ts, 'spot_price': spot_price_at_ts, 'portfolio_delta': np.nan, 'portfolio_gamma': np.nan, 'current_n_underlying': self.current_underlying_hedge_qty, 'current_n_gamma_opt': self.current_gamma_option_hedge_qty, 'net_delta_final':np.nan, 'net_gamma_final':np.nan})
+                        continue
 
-        # Check if the variable was defined, then if it's empty
-        if not final_sim_timestamps_defined:
-            # This case should ideally be caught by the try-except blocks above,
-            # but as a safeguard:
-            logging.error("MatrixDeltaGammaHedgeSimple.run_loop: CRITICAL - final_sim_timestamps was not defined due to an earlier unhandled issue. Exiting.")
-            return pd.DataFrame(), pd.DataFrame()
+                    # Get gamma hedger greeks and price
+                    hedger_D_current, hedger_G_current, hedger_P_current = np.nan, np.nan, np.nan
+                    can_gamma_hedge_this_step = False
 
-        if not final_sim_timestamps: # This is the line (691) that caused the NameError
-            logging.info("MatrixDeltaGammaHedgeSimple.run_loop: final_sim_timestamps list is empty after processing. Exiting.")
-            return pd.DataFrame(), pd.DataFrame()
-        
-        logging.info(f"MatrixDeltaGammaHedgeSimple.run_loop: Proceeding with {len(final_sim_timestamps)} simulation timestamps.")
+                    if self.gamma_hedge_instrument_details:
+                        hedger_D_temp, hedger_G_temp, hedger_P_temp = self._get_gamma_hedger_greeks_and_price(ts, spot_price_at_ts)
+                        if pd.notna(hedger_G_temp) and abs(hedger_G_temp) >= MIN_EFFECTIVE_HEDGER_GAMMA and pd.notna(hedger_D_temp):
+                            hedger_D_current, hedger_G_current, hedger_P_current = hedger_D_temp, hedger_G_temp, hedger_P_temp
+                            can_gamma_hedge_this_step = True
+                        else:
+                            logging.debug(f"Timestamp {ts}: Gamma hedger unsuitable. G={hedger_G_temp}, D={hedger_D_temp}. Gamma hedge option trade will not be made this step.")
+                    
+                    # Step 6.1: Calculate and apply gamma option hedge if feasible
+                    actual_trade_size_gamma_opt = 0.0
+                    if can_gamma_hedge_this_step:
+                        target_total_gamma_opt_qty = -port_gamma / hedger_G_current # Target total units of gamma option
+                        trade_size_gamma_opt_ideal = target_total_gamma_opt_qty - self.current_gamma_option_hedge_qty
+                        
+                        if abs(trade_size_gamma_opt_ideal) > trade_tolerance:
+                            actual_trade_size_gamma_opt = trade_size_gamma_opt_ideal
+                            self.hedge_actions_log.append({
+                                'timestamp': ts, 'instrument': self.gamma_hedge_instrument_details['name'],
+                                'action': 'buy' if actual_trade_size_gamma_opt > 0 else 'sell',
+                                'size': abs(actual_trade_size_gamma_opt),
+                                'price': hedger_P_current if pd.notna(hedger_P_current) else np.nan,
+                                'type': 'gamma_option'
+                            })
+                            self.current_gamma_option_hedge_qty += actual_trade_size_gamma_opt
+                    
+                    # Step 6.2: Calculate delta to be hedged by underlying
+                    # This is: (Portfolio Delta) + (Delta from ALL existing gamma options)
+                    delta_to_be_hedged_by_underlying = port_delta
+                    if self.current_gamma_option_hedge_qty != 0: # If we hold any gamma options
+                        if can_gamma_hedge_this_step and pd.notna(hedger_D_current): # And current hedger delta is valid
+                            delta_to_be_hedged_by_underlying += self.current_gamma_option_hedge_qty * hedger_D_current
+                        elif self.gamma_hedge_instrument_details: # We hold gamma options, but current hedger delta is bad
+                             # This case implies the hedger instrument details are problematic at this step.
+                             # For simplicity, if hedger_D_current is NaN, we can't accurately assess its delta impact.
+                             # A more complex model might try to use the last known good delta or a proxy.
+                             # Here, we proceed, effectively assuming its delta impact is zero if hedger_D_current is NaN for this step.
+                            logging.warning(f"Timestamp {ts}: Delta of existing gamma option position ({self.current_gamma_option_hedge_qty} units of {self.gamma_hedge_instrument_details['name']}) is uncertain as hedger_D_current is {hedger_D_current}. Underlying hedge might be imprecise.")
+
+                    # Step 6.3: Calculate and apply underlying hedge
+                    target_total_underlying_qty = -delta_to_be_hedged_by_underlying # Target total units of underlying
+                    trade_size_underlying = target_total_underlying_qty - self.current_underlying_hedge_qty
+                    
+                    if abs(trade_size_underlying) > trade_tolerance:
+                        self.hedge_actions_log.append({
+                            'timestamp': ts, 'instrument': self.symbol + '-PERP', # Assuming PERP for underlying hedge
+                            'action': 'buy' if trade_size_underlying > 0 else 'sell',
+                            'size': abs(trade_size_underlying),
+                            'price': spot_price_at_ts,
+                            'type': 'delta_underlying'
+                        })
+                        self.current_underlying_hedge_qty += trade_size_underlying
+
+                    # Step 6.4: Log portfolio state *after* hedges for this timestamp
+                    net_delta_final = port_delta + self.current_underlying_hedge_qty # Delta from underlying
+                    net_gamma_final = port_gamma                                    # Gamma from portfolio
+
+                    if self.current_gamma_option_hedge_qty != 0: # If we hold gamma options
+                        if can_gamma_hedge_this_step and pd.notna(hedger_D_current) and pd.notna(hedger_G_current):
+                            net_delta_final += self.current_gamma_option_hedge_qty * hedger_D_current
+                            net_gamma_final += self.current_gamma_option_hedge_qty * hedger_G_current
+                        # If hedger greeks are NaN at this step but we hold positions, net_delta/gamma might not reflect their true contribution
+                    
+                    self.portfolio_state_log.append({
+                        'timestamp': ts, 'spot_price': spot_price_at_ts,
+                        'portfolio_value': port_val, # Original portfolio value before hedges for this step
+                        'portfolio_delta': port_delta, 'portfolio_gamma': port_gamma, # Original portfolio greeks
+                        'target_B': np.nan, # Not directly calculated/used in this stepwise approach
+                        'target_n_underlying': self.current_underlying_hedge_qty, # Total underlying after this step's trade
+                        'target_n_gamma_opt': self.current_gamma_option_hedge_qty, # Total gamma option after this step's trade
+                        'current_n_underlying': self.current_underlying_hedge_qty,
+                        'current_n_gamma_opt': self.current_gamma_option_hedge_qty,
+                        'hedger_delta_at_ts': hedger_D_current if can_gamma_hedge_this_step else np.nan,
+                        'hedger_gamma_at_ts': hedger_G_current if can_gamma_hedge_this_step else np.nan,
+                        'hedger_price_at_ts': hedger_P_current if can_gamma_hedge_this_step else np.nan,
+                        'net_delta_final': net_delta_final, # Net delta of (portfolio + all hedges)
+                        'net_gamma_final': net_gamma_final  # Net gamma of (portfolio + all hedges)
+                    })
+
+                except Exception as e_loop_iter:
+                    logging.error(f"Error in simulation loop iteration at timestamp {ts}: {e_loop_iter}", exc_info=True)
+                    self.portfolio_state_log.append({
+                        'timestamp': ts, 'spot_price': np.nan, 'portfolio_value':np.nan,
+                        'portfolio_delta':np.nan, 'portfolio_gamma':np.nan, 'target_B':np.nan,
+                        'target_n_underlying':self.current_underlying_hedge_qty,
+                        'target_n_gamma_opt':self.current_gamma_option_hedge_qty,
+                        'current_n_underlying':self.current_underlying_hedge_qty,
+                        'current_n_gamma_opt':self.current_gamma_option_hedge_qty,
+                        'hedger_delta_at_ts':np.nan, 'hedger_gamma_at_ts':np.nan,
+                        'hedger_price_at_ts':np.nan, 'net_delta_final':np.nan, 'net_gamma_final':np.nan
+                    })
+            # --- End of Main Simulation Loop ---
+
+            logging.info(f"MatrixDeltaGammaHedgeSimple.run_loop: Simulation finished. Processed {len(final_sim_timestamps)} timestamps.")
+            return pd.DataFrame(self.portfolio_state_log), pd.DataFrame(self.hedge_actions_log)
+
+        except Exception as e_outer_run_loop:
+            logging.error(f"CRITICAL UNHANDLED ERROR in MatrixDeltaGammaHedgeSimple.run_loop: {e_outer_run_loop}", exc_info=True)
+            return pd.DataFrame(), pd.DataFrame() # Ensure a two-DataFrame return
         # ---- End of robust creation ----
 def plot_mm_delta_gamma_hedge(portfolio_state_df, hedge_actions_df, symbol):
     st.subheader(f"MM Delta-Gamma Hedging Simulation Visuals ({symbol})")
