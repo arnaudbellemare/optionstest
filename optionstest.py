@@ -774,6 +774,48 @@ def calculate_hurst_lo_modified(series, min_n=10, max_n=None, q_method='auto'): 
     except Exception as e:
         logging.error(f"Unexpected error during Hurst (Lo) polyfit: {e}")
         return np.nan, results_df
+def plot_hurst_exponent(hurst_val, hurst_data_df):
+    if pd.isna(hurst_val) or hurst_data_df.empty or not all(c in hurst_data_df.columns for c in ['interval', 'rs_mean']): return
+    plot_data = hurst_data_df[hurst_data_df['rs_mean'] > 1e-12].copy()
+    if plot_data.empty or len(plot_data) < 3: return
+    log_intervals = np.log(plot_data['interval']); log_rs = np.log(plot_data['rs_mean'])
+    fitted_rs = None; label_h = hurst_val
+    try:
+        if len(plot_data) >= 3:
+            hurst_plot, intercept_plot, _, _, _ = linregress(log_intervals, log_rs)
+            fitted_rs = intercept_plot + hurst_plot * log_intervals
+    except Exception: pass
+    fig_hurst = go.Figure()
+    fig_hurst.add_trace(go.Scatter(x=log_intervals, y=log_rs, mode='markers', name='Log(Avg R/S) vs Log(n)', marker=dict(color='blue')))
+    if fitted_rs is not None: fig_hurst.add_trace(go.Scatter(x=log_intervals, y=fitted_rs, mode='lines', name=f'Fit (H={label_h:.3f})', line=dict(color='red', dash='dash')))
+    fig_hurst.update_layout(title="Hurst Exponent (Classic R/S)", xaxis_title="Log(Time Interval n)", yaxis_title="Log(Mean R/S)", height=400, width=800)
+    st.plotly_chart(fig_hurst, use_container_width=True)
+    regime = "Trending (H > 0.5)" if 0.55 < hurst_val <= 1.0 else "Mean-Reverting (H < 0.5)" if 0.0 <= hurst_val < 0.45 else "Random Walk (H ≈ 0.5)" if 0.45 <= hurst_val <= 0.55 else f"Unusual (H={hurst_val:.3f})"
+    st.write(f"**Hurst Exponent (Classic R/S, Daily Log Returns): {hurst_val:.3f}** | **Implied Regime:** {regime}")
+
+def calculate_and_display_autocorrelation(daily_log_returns, windows=[7, 15, 30], threshold=0.05):
+    st.subheader("Implied Market Regime (Daily Autocorrelation)")
+    if not isinstance(daily_log_returns, pd.Series) or daily_log_returns.empty: return
+    cleaned_returns = daily_log_returns.dropna()
+    if cleaned_returns.empty: return
+    regime_map = {"≈": "Mean Reverting", "—": "Random Walk", "↑": "Persistent Up", "↓": "Persistent Down", "?": "Unknown", "!": "Error"}
+    cols = st.columns(len(windows))
+    for i, window in enumerate(windows):
+        with cols[i]:
+            regime_symbol = "?"
+            if len(cleaned_returns) >= window and len(cleaned_returns.tail(window)) >= 2:
+                try:
+                    autocorr_val = cleaned_returns.tail(window).autocorr(lag=1)
+                    if pd.isna(autocorr_val): pass
+                    elif autocorr_val < -threshold: regime_symbol = "≈"
+                    elif autocorr_val > threshold:
+                        avg_return = cleaned_returns.tail(window).mean()
+                        if pd.notna(avg_return): regime_symbol = "↑" if avg_return > 0 else "↓"
+                    else: regime_symbol = "—"
+                except Exception: regime_symbol = "!"
+            st.markdown(f"<p style='text-align: center; font-size: small; color: grey; margin-bottom: -10px;'>{window}-Day</p>", unsafe_allow_html=True)
+            st.markdown(f"<h1 style='text-align: center; margin-bottom: -10px;'>{regime_symbol}</h1>", unsafe_allow_html=True)
+            st.markdown(f"<p style='text-align: center; font-size: small; margin-top: 0px;'>{regime_map.get(regime_symbol, 'Unknown')}</p>", unsafe_allow_html=True)        
 def plot_combined_premium_difference(df_atm_results, df_itm_results, expiry_label): # df_agg_oi_results removed as it's not used
     st.subheader(f"Options Premium Bias Comparison (Expiry: {expiry_label})")
     valid_atm = isinstance(df_atm_results, pd.DataFrame) and not df_atm_results.empty and 'atm_difference' in df_atm_results.columns and 'date_time' in df_atm_results.columns
