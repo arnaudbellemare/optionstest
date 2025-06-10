@@ -1399,41 +1399,112 @@ def main():
         safe_plot(plot_delta_oi_heatmap_refined, dft, df_krak_5m, selected_expiry)
         safe_plot(plot_gex_heatmap, dft, df_krak_5m, selected_expiry)
         safe_plot(plot_net_delta_flow_heatmap, dft, df_krak_5m, selected_expiry, coin)
-
-    # =========================== MM Indicative Delta-Gamma Hedge ==========================
-    st.markdown("---"); st.header("MM Indicative Delta-Gamma Hedge Adjustment")
-    if not dft_latest.empty and pd.notna(spot_price) and pd.notna(st.session_state.snapshot_time):
+# =========================== MM Indicative Delta-Gamma Hedge (Snapshot Analysis) ==========================
+    st.markdown("---")
+    st.header("MM Indicative Delta-Gamma Hedge Adjustment (Latest Snapshot)")
+    if not dft_latest.empty and pd.notna(spot_price) and st.session_state.snapshot_time is not None: # Check snapshot_time directly
+        # This function 'display_mm_gamma_adjustment_analysis' is for the single point-in-time analysis
         safe_plot(display_mm_gamma_adjustment_analysis, dft_latest, spot_price, st.session_state.snapshot_time, risk_free_rate)
+    else:
+        if dft_latest.empty:
+            logging.warning("Skipping MM Indicative D-G Snapshot: dft_latest is empty.")
+        if not pd.notna(spot_price):
+            logging.warning("Skipping MM Indicative D-G Snapshot: spot_price is NaN.")
+        if st.session_state.snapshot_time is None:
+            logging.warning("Skipping MM Indicative D-G Snapshot: st.session_state.snapshot_time is None.")
+
+    # =========================== MM Delta-Gamma Hedge Simulation Plot ==========================
+    # This section is for the historical simulation and its plot
+    st.markdown("---") # Optional: Add a separator if you want to visually distinguish it more
+    # The header for the simulation plot might be better inside the 'if show_mm_dg_sim_main:' block
     
-    show_mm_dg_sim_main = st.sidebar.checkbox("Show MM D-G Hedge Sim Plot", value=True, key="show_mm_dg_sim_main_plot_v2") # Changed key
+    show_mm_dg_sim_main = st.sidebar.checkbox("Show MM D-G Hedge Sim Plot", value=True, key="show_mm_dg_sim_main_plot_v3") # Incremented key for uniqueness
+
+    # Initialize DataFrames to ensure they are defined even if the simulation doesn't run
+    mm_dg_portfolio_state_df_sim = pd.DataFrame()
+    mm_dg_hedge_actions_df_sim = pd.DataFrame()
+
     if show_mm_dg_sim_main:
+        st.header("MM Delta-Gamma Hedging Simulation (Historical)") # Header for this specific section
         if not dft.empty and not df_krak_5m.empty and selected_expiry and not dft_latest.empty:
-            gamma_hedger_candidate_df = dft_latest[(dft_latest['option_type'] == 'C') & (dft_latest['k'] >= spot_price)].sort_values('k')
-            if gamma_hedger_candidate_df.empty and not dft_latest[dft_latest['option_type'] == 'C'].empty: # Fallback if no OTM/ATM calls
-                 gamma_hedger_candidate_df = dft_latest[dft_latest['option_type'] == 'C'].iloc[[abs(dft_latest[dft_latest['option_type'] == 'C']['k'] - spot_price).idxmin()]]
+            # --- Selecting the Gamma Hedging Instrument for the Simulation ---
+            # We use dft_latest to pick the instrument based on the *current* market state,
+            # but the simulation will use historical data for this instrument's greeks.
+            
+            # Prefer ATM or slightly OTM calls from the selected expiry
+            gamma_hedger_candidate_df = dft_latest[
+                (dft_latest['option_type'] == 'C') &
+                (dft_latest['k'] >= spot_price) # ATM or OTM calls
+            ].sort_values('k') # Sort by strike, ascending (closest to spot_price first among these)
 
-
+            if gamma_hedger_candidate_df.empty: # Fallback 1: If no ATM/OTM calls, try any call
+                all_calls_latest = dft_latest[dft_latest['option_type'] == 'C']
+                if not all_calls_latest.empty:
+                    # Find the call closest to the spot price (could be ITM)
+                    gamma_hedger_candidate_df = all_calls_latest.loc[[
+                        abs(all_calls_latest['k'] - spot_price).idxmin()
+                    ]]
+                    logging.info("MM D-G Sim: No ATM/OTM calls found. Using closest ITM call as fallback for gamma hedger.")
+                else:
+                    logging.warning("MM D-G Sim: No call options found in dft_latest for the selected expiry.")
+            
             if not gamma_hedger_candidate_df.empty:
                 gamma_hedger_row_sim = gamma_hedger_candidate_df.iloc[0]
-# In main() function, when preparing gamma_hedger_details_sim:
+                
                 gamma_hedger_details_sim = {
                     'name': gamma_hedger_row_sim['instrument_name'],
-                    # Other details like k, option_type, expiry can be stored for reference
-                    # but are primarily looked up via the instrument_name from df_portfolio_options
                     'k': gamma_hedger_row_sim['k'],
                     'option_type': gamma_hedger_row_sim['option_type'],
                     'expiry_datetime_col': gamma_hedger_row_sim['expiry_datetime_col']
                 }
+                logging.info(f"MM D-G Sim: Selected gamma hedging instrument: {gamma_hedger_details_sim['name']}")
+
                 try:
-                    mm_dg_sim_instance = MatrixDeltaGammaHedgeSimple(df_portfolio_options=dft, spot_df=df_krak_5m, symbol=coin, risk_free_rate=risk_free_rate, gamma_hedge_instrument_details=gamma_hedger_details_sim)
+                    # Instantiate the simulation class
+                    mm_dg_sim_instance = MatrixDeltaGammaHedgeSimple(
+                        df_portfolio_options=dft,       # Full historical data for the portfolio
+                        spot_df=df_krak_5m,             # Historical spot data
+                        symbol=coin,
+                        risk_free_rate=risk_free_rate,
+                        gamma_hedge_instrument_details=gamma_hedger_details_sim
+                    )
+                    logging.info("MM D-G Sim: MatrixDeltaGammaHedgeSimple instance created.")
+
+                    # Run the simulation loop
                     with st.spinner("Running MM Delta-Gamma Hedge Simulation..."):
-                        mm_dg_portfolio_state_df_sim, mm_dg_hedge_actions_df_sim = mm_dg_sim_instance.run_loop(days=5)
+                        # Ensure 'days' parameter is appropriate for your data range in 'dft' and 'df_krak_5m'
+                        sim_days = 5 # Or make this configurable
+                        mm_dg_portfolio_state_df_sim, mm_dg_hedge_actions_df_sim = mm_dg_sim_instance.run_loop(days=sim_days)
+                    
+                    logging.info(f"MM D-G Sim: run_loop completed. Portfolio states: {len(mm_dg_portfolio_state_df_sim)}, Hedge actions: {len(mm_dg_hedge_actions_df_sim)}")
+
+                    # Plot results if simulation produced data
                     if not mm_dg_portfolio_state_df_sim.empty:
                         safe_plot(plot_mm_delta_gamma_hedge, mm_dg_portfolio_state_df_sim, mm_dg_hedge_actions_df_sim, coin)
-                except Exception as e_mm_sim: st.error(f"MM D-G Sim Error: {e_mm_sim}")
-            else: st.warning("Could not find a suitable Call option in latest snapshot for MM D-G Sim.")
+                    else:
+                        st.info("MM D-G Sim: Simulation ran but produced no portfolio state data to plot.")
+                        logging.info("MM D-G Sim: mm_dg_portfolio_state_df_sim is empty after run_loop.")
 
-
+                except ValueError as ve_init_sim: # Catch specific init errors from MatrixDeltaGammaHedgeSimple
+                    st.error(f"MM D-G Sim Initialization Error: {ve_init_sim}")
+                    logging.error(f"MM D-G Sim: ValueError during MatrixDeltaGammaHedgeSimple initialization: {ve_init_sim}", exc_info=True)
+                except Exception as e_mm_sim: # Catch any other errors during instantiation or run_loop
+                    st.error(f"MM D-G Sim Runtime Error: {e_mm_sim}")
+                    logging.error(f"MM D-G Sim: Exception during run or init: {e_mm_sim}", exc_info=True)
+            
+            else: # If gamma_hedger_candidate_df is still empty after fallbacks
+                st.warning("MM D-G Sim: Could not find any suitable Call option in the latest snapshot to use as a gamma hedging instrument for the simulation.")
+                logging.warning("MM D-G Sim: gamma_hedger_candidate_df remained empty. Cannot run simulation.")
+        
+        else: # Conditions for running simulation not met (e.g., dft or df_krak_5m empty)
+            missing_data_reasons = []
+            if dft.empty: missing_data_reasons.append("'dft' (historical options data) is empty")
+            if df_krak_5m.empty: missing_data_reasons.append("'df_krak_5m' (historical spot data) is empty")
+            if not selected_expiry: missing_data_reasons.append("'selected_expiry' is not set")
+            if dft_latest.empty: missing_data_reasons.append("'dft_latest' (latest options snapshot) is empty")
+            
+            st.warning(f"MM D-G Sim: Cannot run simulation due to missing data: {', '.join(missing_data_reasons)}.")
+            logging.warning(f"MM D-G Sim: Pre-conditions not met. Reasons: {', '.join(missing_data_reasons)}")
 
 
 
