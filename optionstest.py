@@ -1319,8 +1319,10 @@ def plot_mm_delta_gamma_hedge(portfolio_state_df, hedge_actions_df, symbol, net_
         # Plot original Net Gamma (de-emphasized)
         if portfolio_state_df['net_gamma_final'].notna().any():
             fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['net_gamma_final'],
-                                     mode='lines', name='Net Gamma (Raw)',
-                                     line=dict(color='rgba(255, 0, 255, 0.5)', width=1, dash='dot')), # Magenta with 0.5 opacity
+                                     mode='lines', name='Net Gamma (Raw)', 
+                                     # MODIFICATION HERE: Changed opacity to RGBA color
+                                     line=dict(color='rgba(255,0,255,0.6)', width=1, dash='dot')), # Magenta with 0.6 opacity
+                                     # END MODIFICATION
                           secondary_y=True, row=1, col=1)
             
             # Calculate and plot SMA (emphasized)
@@ -1329,7 +1331,7 @@ def plot_mm_delta_gamma_hedge(portfolio_state_df, hedge_actions_df, symbol, net_
                 net_gamma_sma = portfolio_state_df['net_gamma_final'].rolling(window=net_gamma_sma_window, min_periods=1).mean()
                 fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=net_gamma_sma,
                                          mode='lines', name=f'Net Gamma SMA ({net_gamma_sma_window})',
-                                         line=dict(color='gold', width=2, dash='solid')), 
+                                         line=dict(color='gold', width=2, dash='solid')), # Emphasized style
                               secondary_y=True, row=1, col=1)
             elif num_valid_gamma_points > 0 : 
                 logging.info(f"plot_mm_delta_gamma_hedge: Not enough valid data points ({num_valid_gamma_points}) for SMA (window {net_gamma_sma_window}). Plotting only raw Net Gamma (de-emphasized).")
