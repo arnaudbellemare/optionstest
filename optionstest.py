@@ -1296,26 +1296,103 @@ class MatrixDeltaGammaHedgeSimple:
             logging.error(f"CRITICAL UNHANDLED ERROR in MatrixDeltaGammaHedgeSimple.run_loop: {e_outer_run_loop}", exc_info=True)
             return pd.DataFrame(), pd.DataFrame() # Ensure a two-DataFrame return
         # ---- End of robust creation ----
-def plot_mm_delta_gamma_hedge(portfolio_state_df, hedge_actions_df, symbol):
+def plot_mm_delta_gamma_hedge(portfolio_state_df, hedge_actions_df, symbol, net_gamma_sma_window=10):
     st.subheader(f"MM Delta-Gamma Hedging Simulation Visuals ({symbol})")
-    if portfolio_state_df.empty: return
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, subplot_titles=("Net Portfolio Greeks (Delta & Gamma)", f"Underlying Hedge Position ({symbol}) & Spot Price", "Gamma Option Hedge Position"), specs=[[{"secondary_y": True}], [{"secondary_y": True}], [{"secondary_y": False}]])
-    if 'net_delta_final' in portfolio_state_df.columns: fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['net_delta_final'], mode='lines', name='Net Delta', line=dict(color='cyan')), secondary_y=False, row=1, col=1)
-    if 'net_gamma_final' in portfolio_state_df.columns: fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['net_gamma_final'], mode='lines', name='Net Gamma', line=dict(color='magenta')), secondary_y=True, row=1, col=1)
-    fig.add_hline(y=0, line_dash="dot", line_color="grey", row=1, col=1, secondary_y=False)
-    if 'current_n_underlying' in portfolio_state_df.columns: fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['current_n_underlying'], mode='lines', name=f'Underlying Hedge ({symbol})', line=dict(color='lightgreen')), secondary_y=False, row=2, col=1)
-    if 'spot_price' in portfolio_state_df.columns: fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['spot_price'], mode='lines', name='Spot Price', line=dict(color='grey', dash='dash')), secondary_y=True, row=2, col=1)
-    if 'current_n_gamma_opt' in portfolio_state_df.columns: fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['current_n_gamma_opt'], mode='lines', name='Gamma Option Hedge Qty', line=dict(color='orange')), row=3, col=1)
+    if portfolio_state_df.empty:
+        st.info("No portfolio state data to plot for MM Delta-Gamma Hedging Simulation.")
+        return
+
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+                        subplot_titles=("Net Portfolio Greeks (Delta & Gamma)",
+                                        f"Underlying Hedge Position ({symbol}) & Spot Price",
+                                        "Gamma Option Hedge Position"),
+                        specs=[[{"secondary_y": True}], [{"secondary_y": True}], [{"secondary_y": False}]])
+
+    # Plot Net Delta
+    if 'net_delta_final' in portfolio_state_df.columns and portfolio_state_df['net_delta_final'].notna().any():
+        fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['net_delta_final'],
+                                 mode='lines', name='Net Delta', line=dict(color='cyan')),
+                      secondary_y=False, row=1, col=1)
+
+    # Plot Net Gamma and its SMA
+    if 'net_gamma_final' in portfolio_state_df.columns:
+        # Plot original Net Gamma if it has any data
+        if portfolio_state_df['net_gamma_final'].notna().any():
+            fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['net_gamma_final'],
+                                     mode='lines', name='Net Gamma', line=dict(color='magenta')),
+                          secondary_y=True, row=1, col=1)
+            
+            # Calculate and plot SMA if enough data points and window is valid
+            num_valid_gamma_points = portfolio_state_df['net_gamma_final'].notna().sum()
+            if net_gamma_sma_window >= 2 and num_valid_gamma_points >= net_gamma_sma_window:
+                net_gamma_sma = portfolio_state_df['net_gamma_final'].rolling(window=net_gamma_sma_window, min_periods=1).mean()
+                fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=net_gamma_sma,
+                                         mode='lines', name=f'Net Gamma SMA ({net_gamma_sma_window})',
+                                         line=dict(color='gold', dash='dash')), 
+                              secondary_y=True, row=1, col=1)
+            elif num_valid_gamma_points > 0 : # Not enough for SMA, but some data exists
+                logging.info(f"plot_mm_delta_gamma_hedge: Not enough valid data points ({num_valid_gamma_points}) for SMA (window {net_gamma_sma_window}). Plotting only raw Net Gamma.")
+        else:
+            logging.info("plot_mm_delta_gamma_hedge: No valid (non-NaN) Net Gamma data to plot.")
+    else:
+        logging.info("plot_mm_delta_gamma_hedge: 'net_gamma_final' column missing. Cannot plot Net Gamma.")
+
+
+    fig.add_hline(y=0, line_dash="dot", line_color="grey", row=1, col=1, secondary_y=False) # For Delta
+
+
+    # Plot Underlying Hedge Position and Spot Price
+    if 'current_n_underlying' in portfolio_state_df.columns and portfolio_state_df['current_n_underlying'].notna().any():
+        fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['current_n_underlying'],
+                                 mode='lines', name=f'Underlying Hedge ({symbol})', line=dict(color='lightgreen')),
+                      secondary_y=False, row=2, col=1)
+    if 'spot_price' in portfolio_state_df.columns and portfolio_state_df['spot_price'].notna().any():
+        fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['spot_price'],
+                                 mode='lines', name='Spot Price', line=dict(color='grey', dash='dash')),
+                      secondary_y=True, row=2, col=1)
+
+    # Plot Gamma Option Hedge Position
+    if 'current_n_gamma_opt' in portfolio_state_df.columns and portfolio_state_df['current_n_gamma_opt'].notna().any():
+        fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['current_n_gamma_opt'],
+                                 mode='lines', name='Gamma Option Hedge Qty', line=dict(color='orange')),
+                      row=3, col=1)
+
+    # Add trade markers
     if not hedge_actions_df.empty and 'type' in hedge_actions_df.columns:
-        underlying_trades = hedge_actions_df[hedge_actions_df['type'] == 'delta_underlying']; gamma_option_trades = hedge_actions_df[hedge_actions_df['type'] == 'gamma_option']
+        underlying_trades = hedge_actions_df[hedge_actions_df['type'] == 'delta_underlying']
+        gamma_option_trades = hedge_actions_df[hedge_actions_df['type'] == 'gamma_option']
+
         for _, trade in underlying_trades.iterrows():
-            y_val = portfolio_state_df[portfolio_state_df['timestamp'] == trade['timestamp']]['current_n_underlying'].iloc[0] if not portfolio_state_df[portfolio_state_df['timestamp'] == trade['timestamp']].empty else np.nan
-            fig.add_trace(go.Scatter(x=[trade['timestamp']], y=[y_val], mode='markers', marker=dict(symbol='triangle-up' if trade['action']=='buy' else 'triangle-down', size=8, color='lime' if trade['action']=='buy' else 'red'), name=f"{trade['action']} Underlying", showlegend=False), row=2, col=1, secondary_y=False)
+            state_at_trade_time = portfolio_state_df[portfolio_state_df['timestamp'] == trade['timestamp']]
+            y_val = state_at_trade_time['current_n_underlying'].iloc[0] if not state_at_trade_time.empty else np.nan
+            if pd.notna(y_val):
+                fig.add_trace(go.Scatter(x=[trade['timestamp']], y=[y_val], mode='markers',
+                                         marker=dict(symbol='triangle-up' if trade['action'] == 'buy' else 'triangle-down',
+                                                     size=8, color='lime' if trade['action'] == 'buy' else 'red'),
+                                         name=f"{trade['action']} Underlying", showlegend=False,
+                                         hoverinfo='skip'),
+                              row=2, col=1, secondary_y=False)
+
         for _, trade in gamma_option_trades.iterrows():
-            y_val_gamma = portfolio_state_df[portfolio_state_df['timestamp'] == trade['timestamp']]['current_n_gamma_opt'].iloc[0] if not portfolio_state_df[portfolio_state_df['timestamp'] == trade['timestamp']].empty else np.nan
-            fig.add_trace(go.Scatter(x=[trade['timestamp']], y=[y_val_gamma], mode='markers', marker=dict(symbol='circle', size=7, color='yellow' if trade['action']=='buy' else 'purple'), name=f"{trade['action']} Gamma Option", showlegend=False), row=3, col=1)
-    fig.update_layout(height=900, hovermode='x unified', legend=dict(orientation="h", yanchor="bottom", y=1.02))
-    fig.update_yaxes(title_text="Net Delta", secondary_y=False, row=1, col=1); fig.update_yaxes(title_text="Net Gamma", secondary_y=True, row=1, col=1, tickformat=".2e"); fig.update_yaxes(title_text="Underlying Qty", secondary_y=False, row=2, col=1); fig.update_yaxes(title_text="Spot Price", secondary_y=True, row=2, col=1, showgrid=False); fig.update_yaxes(title_text="Gamma Option Qty", row=3, col=1); fig.update_xaxes(title_text="Timestamp", row=3, col=1)
+            state_at_trade_time = portfolio_state_df[portfolio_state_df['timestamp'] == trade['timestamp']]
+            y_val_gamma = state_at_trade_time['current_n_gamma_opt'].iloc[0] if not state_at_trade_time.empty else np.nan
+            if pd.notna(y_val_gamma):
+                fig.add_trace(go.Scatter(x=[trade['timestamp']], y=[y_val_gamma], mode='markers',
+                                         marker=dict(symbol='circle', size=7,
+                                                     color='yellow' if trade['action'] == 'buy' else 'purple'),
+                                         name=f"{trade['action']} Gamma Option", showlegend=False,
+                                         hoverinfo='skip'),
+                              row=3, col=1)
+
+    fig.update_layout(height=900, hovermode='x unified',
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    fig.update_yaxes(title_text="Net Delta", secondary_y=False, row=1, col=1)
+    fig.update_yaxes(title_text="Net Gamma", secondary_y=True, row=1, col=1, tickformat=".2e")
+    fig.update_yaxes(title_text="Underlying Qty", secondary_y=False, row=2, col=1)
+    fig.update_yaxes(title_text="Spot Price", secondary_y=True, row=2, col=1, showgrid=False)
+    fig.update_yaxes(title_text="Gamma Option Qty", row=3, col=1)
+    fig.update_xaxes(title_text="Timestamp", row=3, col=1)
+
     st.plotly_chart(fig, use_container_width=True)
 def compute_and_plot_itm_gex_ratio(dft, df_krak_5m, spot_price_latest, selected_expiry_obj):
     expiry_label = "N/A"; coin = "N/A"
@@ -1400,6 +1477,8 @@ def main():
     if 'selected_coin' not in st.session_state: st.session_state.selected_coin = "BTC"
     if 'snapshot_time' not in st.session_state: st.session_state.snapshot_time = dt.datetime.now(dt.timezone.utc)
     if 'risk_free_rate_input' not in st.session_state: st.session_state.risk_free_rate_input = 0.01
+    if 'net_gamma_sma_window_input' not in st.session_state: st.session_state.net_gamma_sma_window_input = 10 # Default SMA window
+
 
     st.title(f"{st.session_state.selected_coin} Options: Delta Hedging & MM Perspective")
 
@@ -1422,6 +1501,15 @@ def main():
     coin = st.session_state.selected_coin
     st.session_state.risk_free_rate_input = st.sidebar.number_input("Risk-Free Rate", value=st.session_state.get('risk_free_rate_input', 0.01), min_value=0.0, max_value=0.2, step=0.001, format="%.3f", key="rf_rate_focused_v3")
     risk_free_rate = st.session_state.risk_free_rate_input
+    
+    st.session_state.net_gamma_sma_window_input = st.sidebar.number_input(
+        "Net Gamma SMA Window (Plot)", 
+        value=st.session_state.get('net_gamma_sma_window_input', 10), 
+        min_value=2, max_value=50, step=1, 
+        key="net_gamma_sma_window_v1"
+    )
+    net_gamma_sma_window_plot = st.session_state.net_gamma_sma_window_input
+
 
     with st.spinner("Fetching Thalex instruments..."): all_instruments_list = fetch_instruments()
     if not all_instruments_list: st.error("Failed to fetch Thalex instrument list."); st.stop()
@@ -1544,32 +1632,25 @@ def main():
 
     # =========================== MM Delta-Gamma Hedge Simulation Plot ==========================
     # This section is for the historical simulation and its plot
-    st.markdown("---") # Optional: Add a separator if you want to visually distinguish it more
-    # The header for the simulation plot might be better inside the 'if show_mm_dg_sim_main:' block
+    st.markdown("---") 
     
-    show_mm_dg_sim_main = st.sidebar.checkbox("Show MM D-G Hedge Sim Plot", value=True, key="show_mm_dg_sim_main_plot_v3") # Incremented key for uniqueness
+    show_mm_dg_sim_main = st.sidebar.checkbox("Show MM D-G Hedge Sim Plot", value=True, key="show_mm_dg_sim_main_plot_v3") 
 
-    # Initialize DataFrames to ensure they are defined even if the simulation doesn't run
     mm_dg_portfolio_state_df_sim = pd.DataFrame()
     mm_dg_hedge_actions_df_sim = pd.DataFrame()
 
     if show_mm_dg_sim_main:
-        st.header("MM Delta-Gamma Hedging Simulation (Historical)") # Header for this specific section
+        st.header("MM Delta-Gamma Hedging Simulation (Historical)") 
         if not dft.empty and not df_krak_5m.empty and selected_expiry and not dft_latest.empty:
-            # --- Selecting the Gamma Hedging Instrument for the Simulation ---
-            # We use dft_latest to pick the instrument based on the *current* market state,
-            # but the simulation will use historical data for this instrument's greeks.
             
-            # Prefer ATM or slightly OTM calls from the selected expiry
             gamma_hedger_candidate_df = dft_latest[
                 (dft_latest['option_type'] == 'C') &
-                (dft_latest['k'] >= spot_price) # ATM or OTM calls
-            ].sort_values('k') # Sort by strike, ascending (closest to spot_price first among these)
+                (dft_latest['k'] >= spot_price) 
+            ].sort_values('k') 
 
-            if gamma_hedger_candidate_df.empty: # Fallback 1: If no ATM/OTM calls, try any call
+            if gamma_hedger_candidate_df.empty: 
                 all_calls_latest = dft_latest[dft_latest['option_type'] == 'C']
                 if not all_calls_latest.empty:
-                    # Find the call closest to the spot price (could be ITM)
                     gamma_hedger_candidate_df = all_calls_latest.loc[[
                         abs(all_calls_latest['k'] - spot_price).idxmin()
                     ]]
@@ -1589,43 +1670,43 @@ def main():
                 logging.info(f"MM D-G Sim: Selected gamma hedging instrument: {gamma_hedger_details_sim['name']}")
 
                 try:
-                    # Instantiate the simulation class
                     mm_dg_sim_instance = MatrixDeltaGammaHedgeSimple(
-                        df_portfolio_options=dft,       # Full historical data for the portfolio
-                        spot_df=df_krak_5m,             # Historical spot data
+                        df_portfolio_options=dft,      
+                        spot_df=df_krak_5m,            
                         symbol=coin,
                         risk_free_rate=risk_free_rate,
                         gamma_hedge_instrument_details=gamma_hedger_details_sim
                     )
                     logging.info("MM D-G Sim: MatrixDeltaGammaHedgeSimple instance created.")
 
-                    # Run the simulation loop
                     with st.spinner("Running MM Delta-Gamma Hedge Simulation..."):
-                        # Ensure 'days' parameter is appropriate for your data range in 'dft' and 'df_krak_5m'
-                        sim_days = 5 # Or make this configurable
+                        sim_days = 5 
                         mm_dg_portfolio_state_df_sim, mm_dg_hedge_actions_df_sim = mm_dg_sim_instance.run_loop(days=sim_days)
                     
                     logging.info(f"MM D-G Sim: run_loop completed. Portfolio states: {len(mm_dg_portfolio_state_df_sim)}, Hedge actions: {len(mm_dg_hedge_actions_df_sim)}")
 
-                    # Plot results if simulation produced data
                     if not mm_dg_portfolio_state_df_sim.empty:
-                        safe_plot(plot_mm_delta_gamma_hedge, mm_dg_portfolio_state_df_sim, mm_dg_hedge_actions_df_sim, coin)
+                        safe_plot(plot_mm_delta_gamma_hedge, 
+                                  mm_dg_portfolio_state_df_sim, 
+                                  mm_dg_hedge_actions_df_sim, 
+                                  coin,
+                                  net_gamma_sma_window=net_gamma_sma_window_plot) # Pass SMA window
                     else:
                         st.info("MM D-G Sim: Simulation ran but produced no portfolio state data to plot.")
                         logging.info("MM D-G Sim: mm_dg_portfolio_state_df_sim is empty after run_loop.")
 
-                except ValueError as ve_init_sim: # Catch specific init errors from MatrixDeltaGammaHedgeSimple
+                except ValueError as ve_init_sim: 
                     st.error(f"MM D-G Sim Initialization Error: {ve_init_sim}")
                     logging.error(f"MM D-G Sim: ValueError during MatrixDeltaGammaHedgeSimple initialization: {ve_init_sim}", exc_info=True)
-                except Exception as e_mm_sim: # Catch any other errors during instantiation or run_loop
+                except Exception as e_mm_sim: 
                     st.error(f"MM D-G Sim Runtime Error: {e_mm_sim}")
                     logging.error(f"MM D-G Sim: Exception during run or init: {e_mm_sim}", exc_info=True)
             
-            else: # If gamma_hedger_candidate_df is still empty after fallbacks
+            else: 
                 st.warning("MM D-G Sim: Could not find any suitable Call option in the latest snapshot to use as a gamma hedging instrument for the simulation.")
                 logging.warning("MM D-G Sim: gamma_hedger_candidate_df remained empty. Cannot run simulation.")
         
-        else: # Conditions for running simulation not met (e.g., dft or df_krak_5m empty)
+        else: 
             missing_data_reasons = []
             if dft.empty: missing_data_reasons.append("'dft' (historical options data) is empty")
             if df_krak_5m.empty: missing_data_reasons.append("'df_krak_5m' (historical spot data) is empty")
