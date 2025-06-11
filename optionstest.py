@@ -1316,22 +1316,23 @@ def plot_mm_delta_gamma_hedge(portfolio_state_df, hedge_actions_df, symbol, net_
 
     # Plot Net Gamma and its SMA
     if 'net_gamma_final' in portfolio_state_df.columns:
-        # Plot original Net Gamma if it has any data
+        # Plot original Net Gamma (de-emphasized)
         if portfolio_state_df['net_gamma_final'].notna().any():
             fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['net_gamma_final'],
-                                     mode='lines', name='Net Gamma', line=dict(color='magenta')),
+                                     mode='lines', name='Net Gamma (Raw)', 
+                                     line=dict(color='magenta', width=1, dash='dot', opacity=0.6)), # De-emphasized style
                           secondary_y=True, row=1, col=1)
             
-            # Calculate and plot SMA if enough data points and window is valid
+            # Calculate and plot SMA (emphasized)
             num_valid_gamma_points = portfolio_state_df['net_gamma_final'].notna().sum()
             if net_gamma_sma_window >= 2 and num_valid_gamma_points >= net_gamma_sma_window:
                 net_gamma_sma = portfolio_state_df['net_gamma_final'].rolling(window=net_gamma_sma_window, min_periods=1).mean()
                 fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=net_gamma_sma,
                                          mode='lines', name=f'Net Gamma SMA ({net_gamma_sma_window})',
-                                         line=dict(color='gold', dash='dash')), 
+                                         line=dict(color='gold', width=2, dash='solid')), # Emphasized style
                               secondary_y=True, row=1, col=1)
-            elif num_valid_gamma_points > 0 : # Not enough for SMA, but some data exists
-                logging.info(f"plot_mm_delta_gamma_hedge: Not enough valid data points ({num_valid_gamma_points}) for SMA (window {net_gamma_sma_window}). Plotting only raw Net Gamma.")
+            elif num_valid_gamma_points > 0 : 
+                logging.info(f"plot_mm_delta_gamma_hedge: Not enough valid data points ({num_valid_gamma_points}) for SMA (window {net_gamma_sma_window}). Plotting only raw Net Gamma (de-emphasized).")
         else:
             logging.info("plot_mm_delta_gamma_hedge: No valid (non-NaN) Net Gamma data to plot.")
     else:
